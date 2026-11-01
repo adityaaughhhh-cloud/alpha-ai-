@@ -7,17 +7,20 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# Get API key from Render Environment Variables
+
+# -----------------------------
+# ALPHA AI CONFIGURATION
+# -----------------------------
+
 api_key = os.environ.get("GEMINI_API_KEY")
 
 if not api_key:
     raise ValueError("GEMINI_API_KEY is missing in Render")
 
-# Initialize Gemini
 client = genai.Client(api_key=api_key)
 
-# Chat model
-model_name = "gemini-3.1-flash-lite"
+CHAT_MODEL = "gemini-3.1-flash-lite"
+IMAGE_MODEL = "gemini-nano-banana-2.1"
 
 
 # -----------------------------
@@ -25,11 +28,16 @@ model_name = "gemini-3.1-flash-lite"
 # -----------------------------
 
 def alpha_chat(message, history):
+
     try:
+        if not message or not message.strip():
+            yield "Please enter a message."
+            return
+
         answer = ""
 
         stream = client.models.generate_content_stream(
-            model=model_name,
+            model=CHAT_MODEL,
             contents=message,
             config=types.GenerateContentConfig(
                 max_output_tokens=512,
@@ -46,28 +54,23 @@ def alpha_chat(message, history):
             yield "Alpha couldn't generate a response."
 
     except Exception as e:
-        yield f"ALPHA ERROR: {str(e)}"
+        print("CHAT ERROR:", repr(e))
+        yield "Alpha AI is temporarily unable to answer. Please try again."
 
 
 # -----------------------------
-# ALPHA AI IMAGE CREATOR
+# ALPHA AI IMAGE GENERATOR
 # -----------------------------
 
 def generate_image(prompt):
-    import time
-
-    start = time.time()
 
     try:
         if not prompt or not prompt.strip():
-            return None, "Enter an image description."
+            return None, "Please enter an image description."
 
         interaction = client.interactions.create(
-            model="gemini-3.1-flash-lite-image",
-            input=prompt,
-            generation_config={
-                "thinking_level": "minimal"
-            },
+            model=IMAGE_MODEL,
+            input=prompt.strip(),
             response_format={
                 "type": "image",
                 "aspect_ratio": "1:1",
@@ -75,23 +78,27 @@ def generate_image(prompt):
             }
         )
 
-        if not interaction.output_image:
-            return None, "No image returned."
+        generated = interaction.output_image
 
-        image_bytes = base64.b64decode(
-            interaction.output_image.data
-        )
+        if not generated or not generated.data:
+            return None, "No image was returned by Gemini."
+
+        image_bytes = base64.b64decode(generated.data)
 
         image = Image.open(
             io.BytesIO(image_bytes)
         ).convert("RGB")
 
-        elapsed = time.time() - start
-
-        return image, f"Generated in {elapsed:.2f} seconds!"
+        return image, "Image generated successfully!"
 
     except Exception as e:
-        return None, f"IMAGE ERROR: {str(e)}"
+
+        print("IMAGE ERROR:", repr(e))
+
+        return None, (
+            "Image generation failed. "
+            "Please check the Render logs or try again."
+        )
 
 
 # -----------------------------
@@ -104,10 +111,12 @@ with gr.Blocks(title="ALPHA AI") as app:
         """
         # ALPHA AI
         ### Think Beyond Limits
+        Your AI assistant for questions and image creation.
         """
     )
 
     with gr.Tab("Chat"):
+
         gr.ChatInterface(
             fn=alpha_chat,
             title="Alpha AI Chatbot",
@@ -115,17 +124,23 @@ with gr.Blocks(title="ALPHA AI") as app:
         )
 
     with gr.Tab("Image Creator"):
-        gr.Markdown("### Create images using AI")
+
+        gr.Markdown(
+            "### Create images using artificial intelligence"
+        )
 
         prompt = gr.Textbox(
-            label="Describe your image",
+            label="Image Description",
             placeholder="A futuristic city on Mars..."
         )
 
-        generate_button = gr.Button("Generate Image")
+        generate_button = gr.Button(
+            "Generate Image",
+            variant="primary"
+        )
 
         output_image = gr.Image(
-            label="Your Generated Image",
+            label="Generated Image",
             type="pil"
         )
 
@@ -142,8 +157,9 @@ with gr.Blocks(title="ALPHA AI") as app:
 # START SERVER
 # -----------------------------
 
+app.queue()
+
 app.launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 10000))
         )
- 
