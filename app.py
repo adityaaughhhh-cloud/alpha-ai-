@@ -55,8 +55,7 @@ def alpha_chat(message, history):
 
     except Exception as e:
         print("CHAT ERROR:", repr(e))
-        yield "Alpha AI is temporarily unable to answer. Please try again."
-
+        yield f"Alpha AI Error: {str(e)}"
 
 # -----------------------------
 # ALPHA AI IMAGE GENERATOR
