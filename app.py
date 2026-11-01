@@ -11,7 +11,7 @@ from google.genai import types
 
 
 # ==========================================
-# ALPHA AI 3.0 - CONFIGURATION
+# ALPHA AI 3.1 - CONFIGURATION
 # ==========================================
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -27,11 +27,9 @@ client = genai.Client(api_key=API_KEY)
 # ==========================================
 
 CHAT_MODEL = "gemini-3.5-flash-lite"
-
 BACKUP_MODEL = "gemini-3.1-flash-lite"
 
 IMAGE_MODEL = "gemini-3.1-flash-lite-image"
-
 VIDEO_MODEL = "gemini-omni-1.1-flash"
 
 
@@ -45,7 +43,6 @@ SYSTEM_INSTRUCTION = """
 You are Alpha AI, an intelligent AI assistant.
 
 Rules:
-
 1. Answer accurately.
 2. Answer simple questions briefly.
 3. Explain difficult questions clearly.
@@ -76,10 +73,7 @@ def is_temporary_error(error):
         "internal server error"
     ]
 
-    return any(
-        item in message
-        for item in errors
-    )
+    return any(item in message for item in errors)
 
 
 # ==========================================
@@ -107,9 +101,7 @@ def prepare_chat_contents(message, history):
                 types.Content(
                     role=role,
                     parts=[
-                        types.Part.from_text(
-                            text=content
-                        )
+                        types.Part.from_text(text=content)
                     ]
                 )
             )
@@ -118,9 +110,7 @@ def prepare_chat_contents(message, history):
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(
-                    text=message
-                )
+                types.Part.from_text(text=message)
             ]
         )
     )
@@ -129,13 +119,12 @@ def prepare_chat_contents(message, history):
 
 
 # ==========================================
-# 1. ALPHA AI ULTRA FAST CHAT
+# 1. ALPHA AI FAST CHAT
 # ==========================================
 
 def alpha_chat(message, history):
 
     if not message or not message.strip():
-
         yield "Please enter a message."
         return
 
@@ -157,9 +146,7 @@ def alpha_chat(message, history):
 
         try:
 
-            print(
-                f"ALPHA CHAT MODEL: {model}"
-            )
+            print(f"ALPHA CHAT MODEL: {model}")
 
             config = types.GenerateContentConfig(
 
@@ -176,8 +163,6 @@ def alpha_chat(message, history):
                 )
             )
 
-            # STREAMING RESPONSE
-
             stream = client.models.generate_content_stream(
 
                 model=model,
@@ -193,20 +178,15 @@ def alpha_chat(message, history):
 
                     answer += chunk.text
 
-                    # Immediately display generated text.
-
                     yield answer
 
-            elapsed = (
-                time.monotonic() - start
-            )
+            elapsed = time.monotonic() - start
 
             print(
                 f"ALPHA CHAT COMPLETED: {elapsed:.2f}s"
             )
 
             if not answer:
-
                 yield "No response generated."
 
             return
@@ -216,9 +196,6 @@ def alpha_chat(message, history):
             print(
                 f"CHAT ERROR ({model}): {repr(error)}"
             )
-
-            # If generation already started,
-            # do not restart the answer.
 
             if answer:
 
@@ -230,16 +207,12 @@ def alpha_chat(message, history):
 
                 return
 
-            # Use backup model for temporary failures.
-
             if (
                 index == 0
                 and is_temporary_error(error)
             ):
 
-                print(
-                    "SWITCHING TO BACKUP MODEL"
-                )
+                print("SWITCHING TO BACKUP MODEL")
 
                 time.sleep(0.5)
 
@@ -260,7 +233,6 @@ def alpha_chat(message, history):
 def generate_image(prompt):
 
     if not prompt or not prompt.strip():
-
         return None, "Enter an image description."
 
     start = time.monotonic()
@@ -286,7 +258,6 @@ def generate_image(prompt):
         generated = result.output_image
 
         if not generated or not generated.data:
-
             return None, "No image was returned."
 
         image_bytes = base64.b64decode(
@@ -301,13 +272,9 @@ def generate_image(prompt):
 
         image = image.convert("RGB")
 
-        elapsed = (
-            time.monotonic() - start
-        )
+        elapsed = time.monotonic() - start
 
-        print(
-            f"IMAGE TIME: {elapsed:.2f}s"
-        )
+        print(f"IMAGE TIME: {elapsed:.2f}s")
 
         return (
             image,
@@ -316,10 +283,7 @@ def generate_image(prompt):
 
     except Exception as error:
 
-        print(
-            "IMAGE ERROR:",
-            repr(error)
-        )
+        print("IMAGE ERROR:", repr(error))
 
         return None, f"Image error: {str(error)}"
 
@@ -333,7 +297,6 @@ def analyze_video(video, question):
     try:
 
         if not video:
-
             return "Please upload a video."
 
         if not question or not question.strip():
@@ -355,11 +318,7 @@ def analyze_video(video, question):
             or video_file.state.name == "PROCESSING"
         ):
 
-            if (
-                time.monotonic() - processing_start
-                > 300
-            ):
-
+            if time.monotonic() - processing_start > 300:
                 return "Video processing timed out."
 
             time.sleep(3)
@@ -369,7 +328,6 @@ def analyze_video(video, question):
             )
 
         if video_file.state.name != "ACTIVE":
-
             return "Video processing failed."
 
         response = client.models.generate_content(
@@ -382,23 +340,17 @@ def analyze_video(video, question):
             ],
 
             config=types.GenerateContentConfig(
-
                 max_output_tokens=1024
             )
         )
 
-        elapsed = (
-            time.monotonic() - start
-        )
+        elapsed = time.monotonic() - start
 
         print(
             f"VIDEO ANALYSIS TIME: {elapsed:.2f}s"
         )
 
-        return (
-            response.text
-            or "No analysis generated."
-        )
+        return response.text or "No analysis generated."
 
     except Exception as error:
 
@@ -421,12 +373,9 @@ def generate_video(prompt):
     try:
 
         if not prompt or not prompt.strip():
-
             return None, "Enter a video description."
 
-        print(
-            "ALPHA VIDEO GENERATION STARTED"
-        )
+        print("ALPHA VIDEO GENERATION STARTED")
 
         interaction = client.interactions.create(
 
@@ -447,7 +396,6 @@ def generate_video(prompt):
         video_output = interaction.output_video
 
         if not video_output or not video_output.data:
-
             return None, "No video data returned."
 
         video_bytes = base64.b64decode(
@@ -455,22 +403,15 @@ def generate_video(prompt):
         )
 
         with tempfile.NamedTemporaryFile(
-
             suffix=".mp4",
-
             delete=False
-
         ) as output_file:
 
-            output_file.write(
-                video_bytes
-            )
+            output_file.write(video_bytes)
 
             output_path = output_file.name
 
-        elapsed = (
-            time.monotonic() - start
-        )
+        elapsed = time.monotonic() - start
 
         print(
             f"VIDEO GENERATION TIME: {elapsed:.2f}s"
@@ -496,8 +437,7 @@ def generate_video(prompt):
 # ==========================================
 
 with gr.Blocks(
-    title="ALPHA AI",
-    theme=gr.themes.Soft()
+    title="ALPHA AI"
 ) as app:
 
     gr.Markdown(
@@ -510,7 +450,6 @@ with gr.Blocks(
         """
     )
 
-
     # ======================================
     # CHAT
     # ======================================
@@ -521,8 +460,6 @@ with gr.Blocks(
 
             fn=alpha_chat,
 
-            type="messages",
-
             title="Alpha AI Chatbot",
 
             description=(
@@ -530,7 +467,6 @@ with gr.Blocks(
                 "Powered by fast Gemini models."
             )
         )
-
 
     # ======================================
     # IMAGE CREATOR
@@ -543,42 +479,30 @@ with gr.Blocks(
         )
 
         image_prompt = gr.Textbox(
-
             label="Image Description",
-
-            placeholder=(
-                "A futuristic city on Mars..."
-            )
+            placeholder="A futuristic city on Mars..."
         )
 
         image_button = gr.Button(
-
             "Generate Image",
-
             variant="primary"
         )
 
         image_output = gr.Image(
-
             label="Generated Image",
-
             type="pil"
         )
 
         image_status = gr.Markdown()
 
         image_button.click(
-
             fn=generate_image,
-
             inputs=image_prompt,
-
             outputs=[
                 image_output,
                 image_status
             ]
         )
-
 
     # ======================================
     # VIDEO ANALYZER
@@ -591,45 +515,33 @@ with gr.Blocks(
         )
 
         video_input = gr.Video(
-
             label="Upload Video",
-
             sources=["upload"]
         )
 
         video_question = gr.Textbox(
-
             label="Your Question",
-
             placeholder="Explain this video..."
         )
 
         analyze_button = gr.Button(
-
             "Analyze Video",
-
             variant="primary"
         )
 
         analysis_output = gr.Textbox(
-
             label="Video Analysis",
-
             lines=8
         )
 
         analyze_button.click(
-
             fn=analyze_video,
-
             inputs=[
                 video_input,
                 video_question
             ],
-
             outputs=analysis_output
         )
-
 
     # ======================================
     # VIDEO GENERATOR
@@ -642,9 +554,7 @@ with gr.Blocks(
         )
 
         video_prompt = gr.Textbox(
-
             label="Video Description",
-
             placeholder=(
                 "A cinematic view of Saturn "
                 "rotating in space..."
@@ -652,25 +562,19 @@ with gr.Blocks(
         )
 
         generate_video_button = gr.Button(
-
             "Generate Video",
-
             variant="primary"
         )
 
         generated_video = gr.Video(
-
             label="Generated Video"
         )
 
         video_status = gr.Markdown()
 
         generate_video_button.click(
-
             fn=generate_video,
-
             inputs=video_prompt,
-
             outputs=[
                 generated_video,
                 video_status
@@ -692,5 +596,7 @@ app.launch(
 
     server_port=int(
         os.environ.get("PORT", 10000)
-    )
+    ),
+
+    theme=gr.themes.Soft()
         )
