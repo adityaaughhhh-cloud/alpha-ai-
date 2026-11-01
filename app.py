@@ -54,13 +54,20 @@ def alpha_chat(message, history):
 # -----------------------------
 
 def generate_image(prompt):
+    import time
+
+    start = time.time()
+
     try:
         if not prompt or not prompt.strip():
-            raise ValueError("Please enter an image description.")
+            return None, "Enter an image description."
 
         interaction = client.interactions.create(
-            model="gemini-nano-banana-2.1",
+            model="gemini-3.1-flash-lite-image",
             input=prompt,
+            generation_config={
+                "thinking_level": "minimal"
+            },
             response_format={
                 "type": "image",
                 "aspect_ratio": "1:1",
@@ -68,18 +75,20 @@ def generate_image(prompt):
             }
         )
 
-        generated_image = interaction.output_image
+        if not interaction.output_image:
+            return None, "No image returned."
 
-        if not generated_image or not generated_image.data:
-            raise ValueError("No image was returned by Gemini.")
-
-        image_bytes = base64.b64decode(generated_image.data)
+        image_bytes = base64.b64decode(
+            interaction.output_image.data
+        )
 
         image = Image.open(
             io.BytesIO(image_bytes)
         ).convert("RGB")
 
-        return image, "Image generated successfully!"
+        elapsed = time.time() - start
+
+        return image, f"Generated in {elapsed:.2f} seconds!"
 
     except Exception as e:
         return None, f"IMAGE ERROR: {str(e)}"
