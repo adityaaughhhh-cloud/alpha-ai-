@@ -17,7 +17,7 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 # Chat model
-model_name = "gemini-3.5-flash-lite"
+model_name = "gemini-3.1-flash-lite"
 
 
 # -----------------------------
@@ -146,3 +146,4 @@ app.launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 10000))
         )
+ 
