@@ -1,6 +1,7 @@
 import os
 import io
 import time
+import base64
 import tempfile
 import gradio as gr
 
@@ -22,7 +23,7 @@ client = genai.Client(api_key=API_KEY)
 
 CHAT_MODEL = "gemini-3.5-flash-lite"
 IMAGE_MODEL = "gemini-nano-banana-2.1"
-VIDEO_MODEL = "veo-3.1-generate-preview"
+VIDEO_MODEL = "gemini-omni-1.1-flash"
 
 
 # =====================================
@@ -48,7 +49,7 @@ def alpha_chat(message, history):
 
     except Exception as e:
         print("CHAT ERROR:", repr(e))
-        return "Alpha AI encountered an error. Please try again."
+        return f"Chat error: {str(e)}"
 
 
 # =====================================
@@ -76,8 +77,6 @@ def generate_image(prompt):
         if not generated or not generated.data:
             return None, "No image was returned."
 
-        import base64
-
         image_bytes = base64.b64decode(generated.data)
 
         image = Image.open(
@@ -88,11 +87,11 @@ def generate_image(prompt):
 
     except Exception as e:
         print("IMAGE ERROR:", repr(e))
-        return None, f"Image generation failed: {str(e)}"
+        return None, f"Image error: {str(e)}"
 
 
 # =====================================
-# 3. VIDEO UPLOAD AND ANALYSIS
+# 3. VIDEO ANALYZER
 # =====================================
 
 def analyze_video(video, question):
@@ -104,18 +103,14 @@ def analyze_video(video, question):
         if not question or not question.strip():
             question = "Explain what happens in this video."
 
-        print("Uploading video...")
-
         video_file = client.files.upload(file=video)
-
-        print("Processing video...")
 
         start_time = time.time()
 
         while video_file.state.name == "PROCESSING":
 
             if time.time() - start_time > 300:
-                return "Video processing timed out. Try a shorter video."
+                return "Video processing timed out."
 
             time.sleep(3)
 
@@ -126,32 +121,23 @@ def analyze_video(video, question):
         if video_file.state.name != "ACTIVE":
             return "Video processing failed."
 
-        response = client.interactions.create(
+        response = client.models.generate_content(
             model=CHAT_MODEL,
-            input=[
-                {
-                    "type": "video",
-                    "uri": video_file.uri,
-                    "mime_type": video_file.mime_type
-                },
-                {
-                    "type": "text",
-                    "text": question
-                }
+            contents=[
+                video_file,
+                question
             ]
         )
 
-        return response.output_text or "No analysis generated."
+        return response.text or "No analysis generated."
 
     except Exception as e:
-
         print("VIDEO ANALYSIS ERROR:", repr(e))
-
-        return f"Video analysis failed: {str(e)}"
+        return f"Video analysis error: {str(e)}"
 
 
 # =====================================
-# 4. AI VIDEO GENERATOR
+# 4. VIDEO GENERATOR
 # =====================================
 
 def generate_video(prompt):
@@ -162,34 +148,45 @@ def generate_video(prompt):
         if not prompt or not prompt.strip():
             return None, "Enter a video description."
 
-        print("Starting video generation...")
+        print("Starting Alpha AI video generation...")
 
-        operation = client.models.generate_videos(
+        interaction = client.interactions.create(
             model=VIDEO_MODEL,
-            prompt=prompt.strip(),
-            config=types.GenerateVideosConfig(
-                number_of_videos=1,
-                duration_seconds=5,
-                aspect_ratio="16:9"
-            )
+            input=prompt.strip(),
+            response_format={
+                "type": "video",
+                "aspect_ratio": "16:9",
+                "delivery": "uri"
+            }
         )
+
+        video_output = interaction.output_video
+
+        if not video_output or not video_output.uri:
+            return None, "No video was returned."
+
+        file_name = video_output.uri.split("/")[-1]
+
+        print("Video generated. Waiting for processing...")
 
         start_time = time.time()
 
-        while not operation.done:
+        while True:
+
+            video_file = client.files.get(
+                name=f"files/{file_name}"
+            )
+
+            if video_file.state.name == "ACTIVE":
+                break
+
+            if video_file.state.name == "FAILED":
+                return None, "Video processing failed."
 
             if time.time() - start_time > 600:
-                return None, "Video generation timed out. Try again."
+                return None, "Video processing timed out."
 
-            print("Waiting for video...")
-            time.sleep(10)
-
-            operation = client.operations.get(operation)
-
-        if not operation.response or not operation.response.generated_videos:
-            return None, "No video was generated."
-
-        generated_video = operation.response.generated_videos[0]
+            time.sleep(5)
 
         output_path = tempfile.NamedTemporaryFile(
             suffix=".mp4",
@@ -197,7 +194,7 @@ def generate_video(prompt):
         ).name
 
         client.files.download(
-            file=generated_video.video,
+            file=video_output.uri,
             destination=output_path
         )
 
@@ -207,7 +204,7 @@ def generate_video(prompt):
 
         print("VIDEO GENERATION ERROR:", repr(e))
 
-        return None, f"Video generation failed: {str(e)}"
+        return None, f"Video generation error: {str(e)}"
 
 
 # =====================================
@@ -221,7 +218,7 @@ with gr.Blocks(title="ALPHA AI") as app:
         # ALPHA AI
         ### Think Beyond Limits
 
-        Your AI assistant for chat, images and videos.
+        Your AI assistant for chat, image creation and video creation.
         """
     )
 
@@ -239,7 +236,7 @@ with gr.Blocks(title="ALPHA AI") as app:
 
     with gr.Tab("Image Creator"):
 
-        gr.Markdown("### Create images with AI")
+        gr.Markdown("### Create images using AI")
 
         image_prompt = gr.Textbox(
             label="Image Description",
@@ -300,7 +297,7 @@ with gr.Blocks(title="ALPHA AI") as app:
 
     with gr.Tab("Video Generator"):
 
-        gr.Markdown("### Generate videos using AI")
+        gr.Markdown("### Create videos using AI")
 
         video_prompt = gr.Textbox(
             label="Video Description",
@@ -312,7 +309,7 @@ with gr.Blocks(title="ALPHA AI") as app:
             variant="primary"
         )
 
-        generated_video_output = gr.Video(
+        generated_video = gr.Video(
             label="Generated Video"
         )
 
@@ -322,7 +319,7 @@ with gr.Blocks(title="ALPHA AI") as app:
             fn=generate_video,
             inputs=video_prompt,
             outputs=[
-                generated_video_output,
+                generated_video,
                 video_status
             ]
         )
