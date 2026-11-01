@@ -7,10 +7,11 @@ import gradio as gr
 
 from PIL import Image
 from google import genai
+from google.genai import types
 
 
 # =====================================
-# ALPHA AI CONFIGURATION
+# ALPHA AI 2.0 CONFIGURATION
 # =====================================
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -21,54 +22,278 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 
 
-# MODELS
+# =====================================
+# MODEL CONFIGURATION
+# =====================================
 
-CHAT_MODEL = "gemini-3.5-flash-lite"
+CHAT_MODEL = os.environ.get(
+    "CHAT_MODEL",
+    "gemini-3.8-flash"
+)
 
-# UPDATED FAST IMAGE MODEL
+BACKUP_MODEL = os.environ.get(
+    "BACKUP_MODEL",
+    "gemini-flash-latest"
+)
+
 IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 
 VIDEO_MODEL = "gemini-omni-1.1-flash"
 
 
 # =====================================
-# 1. ALPHA AI CHAT
+# CHAT PERFORMANCE SETTINGS
+# =====================================
+
+MAX_OUTPUT_TOKENS = 512
+
+SYSTEM_INSTRUCTION = """
+You are Alpha AI, a helpful and intelligent AI assistant.
+
+Instructions:
+1. Answer questions accurately.
+2. Keep simple answers short.
+3. Explain difficult questions step by step.
+4. Use mathematical reasoning when necessary.
+5. Avoid unnecessary introductions.
+6. Use clear and simple language.
+7. Never invent facts.
+"""
+
+
+# =====================================
+# ERROR DETECTION
+# =====================================
+
+def is_temporary_error(error):
+
+    message = str(error).lower()
+
+    temporary_errors = [
+        "503",
+        "unavailable",
+        "overloaded",
+        "429",
+        "resource_exhausted",
+        "rate limit",
+        "500",
+        "internal server error"
+    ]
+
+    return any(
+        item in message
+        for item in temporary_errors
+    )
+
+
+# =====================================
+# CHAT HISTORY CONVERSION
+# =====================================
+
+def prepare_chat_contents(message, history):
+
+    contents = []
+
+    if history:
+
+        for item in history[-10:]:
+
+            if isinstance(item, dict):
+
+                role = item.get("role")
+                content = item.get("content")
+
+                if isinstance(content, str) and role in [
+                    "user",
+                    "assistant"
+                ]:
+
+                    contents.append(
+                        types.Content(
+                            role=role,
+                            parts=[
+                                types.Part.from_text(
+                                    text=content
+                                )
+                            ]
+                        )
+                    )
+
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+
+                user_message, assistant_message = item
+
+                if isinstance(user_message, str):
+
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(
+                                    text=user_message
+                                )
+                            ]
+                        )
+                    )
+
+                if isinstance(assistant_message, str):
+
+                    contents.append(
+                        types.Content(
+                            role="assistant",
+                            parts=[
+                                types.Part.from_text(
+                                    text=assistant_message
+                                )
+                            ]
+                        )
+                    )
+
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(
+                    text=message
+                )
+            ]
+        )
+    )
+
+    return contents
+
+
+# =====================================
+# 1. ALPHA AI FAST CHAT
 # =====================================
 
 def alpha_chat(message, history):
 
     if not message or not message.strip():
-        return "Please enter a message."
+
+        yield "Please enter a message."
+        return
 
     start = time.time()
 
-    try:
+    contents = prepare_chat_contents(
+        message.strip(),
+        history
+    )
 
-        response = client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=message,
-        )
+    models = [
+        CHAT_MODEL,
+        BACKUP_MODEL
+    ]
 
-        elapsed = time.time() - start
+    for model_index, model in enumerate(models):
 
-        print(f"CHAT TIME: {elapsed:.2f} seconds")
+        response_text = ""
 
-        return response.text or "No response generated."
+        try:
 
-    except Exception as e:
+            print(
+                f"ALPHA CHAT STARTED: {model}"
+            )
 
-        print("CHAT ERROR:", repr(e))
+            stream = client.models.generate_content_stream(
 
-        return f"Chat error: {str(e)}"
+                model=model,
+
+                contents=contents,
+
+                config=types.GenerateContentConfig(
+
+                    system_instruction=SYSTEM_INSTRUCTION,
+
+                    temperature=0.4,
+
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+
+                    candidate_count=1,
+
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="LOW"
+                    )
+                )
+            )
+
+            for chunk in stream:
+
+                text = chunk.text
+
+                if text:
+
+                    response_text += text
+
+                    # Send partial response immediately.
+                    yield response_text
+
+            elapsed = time.time() - start
+
+            print(
+                f"CHAT MODEL: {model}"
+            )
+
+            print(
+                f"TOTAL CHAT TIME: {elapsed:.2f} seconds"
+            )
+
+            if not response_text:
+
+                yield "Alpha AI could not generate a response."
+
+            return
+
+        except Exception as e:
+
+            print(
+                f"CHAT ERROR ({model}):",
+                repr(e)
+            )
+
+            # Do not restart a response after
+            # some text has already been displayed.
+
+            if response_text:
+
+                yield (
+                    response_text
+                    + "\n\n[Connection interrupted. Please retry.]"
+                )
+
+                return
+
+            # Try backup only for temporary errors.
+
+            if (
+                is_temporary_error(e)
+                and model_index == 0
+            ):
+
+                yield "Alpha AI is switching to its backup model..."
+
+                time.sleep(1)
+
+                continue
+
+            yield (
+                "Alpha AI temporarily cannot answer. "
+                "Please try again shortly.\n\n"
+                + str(e)
+            )
+
+            return
 
 
 # =====================================
-# 2. OPTIMIZED IMAGE GENERATOR
+# 2. IMAGE GENERATOR
 # =====================================
 
 def generate_image(prompt):
 
     if not prompt or not prompt.strip():
+
         return None, "Enter an image description."
 
     start = time.time()
@@ -76,10 +301,6 @@ def generate_image(prompt):
     try:
 
         print("ALPHA IMAGE GENERATION STARTED")
-
-        # STEP 1: SEND IMAGE REQUEST
-
-        api_start = time.time()
 
         result = client.interactions.create(
 
@@ -95,23 +316,11 @@ def generate_image(prompt):
             }
         )
 
-        api_time = time.time() - api_start
-
-        print(
-            f"IMAGE API TIME: {api_time:.2f} seconds"
-        )
-
-        # STEP 2: GET GENERATED IMAGE
-
         generated = result.output_image
 
         if not generated or not generated.data:
 
             return None, "No image was returned."
-
-        # STEP 3: DECODE IMAGE
-
-        decode_start = time.time()
 
         image_bytes = base64.b64decode(
             generated.data
@@ -125,23 +334,15 @@ def generate_image(prompt):
 
         image = image.convert("RGB")
 
-        decode_time = time.time() - decode_start
+        elapsed = time.time() - start
 
         print(
-            f"IMAGE PROCESSING TIME: {decode_time:.2f} seconds"
-        )
-
-        # STEP 4: TOTAL TIME
-
-        total_time = time.time() - start
-
-        print(
-            f"TOTAL IMAGE TIME: {total_time:.2f} seconds"
+            f"IMAGE TIME: {elapsed:.2f} seconds"
         )
 
         return (
             image,
-            f"Image generated successfully in {total_time:.2f} seconds!"
+            f"Image generated in {elapsed:.2f} seconds!"
         )
 
     except Exception as e:
@@ -160,6 +361,7 @@ def analyze_video(video, question):
     try:
 
         if not video:
+
             return "Please upload a video."
 
         if not question or not question.strip():
@@ -172,15 +374,12 @@ def analyze_video(video, question):
             file=video
         )
 
-        upload_time = time.time() - start
-
-        print(
-            f"VIDEO UPLOAD TIME: {upload_time:.2f} seconds"
-        )
-
         processing_start = time.time()
 
-        while video_file.state.name == "PROCESSING":
+        while (
+            not video_file.state
+            or video_file.state.name == "PROCESSING"
+        ):
 
             if time.time() - processing_start > 300:
 
@@ -203,7 +402,11 @@ def analyze_video(video, question):
             contents=[
                 video_file,
                 question
-            ]
+            ],
+
+            config=types.GenerateContentConfig(
+                max_output_tokens=1024
+            )
         )
 
         elapsed = time.time() - start
@@ -226,8 +429,6 @@ def analyze_video(video, question):
 # =====================================
 
 def generate_video(prompt):
-
-    output_path = None
 
     start = time.time()
 
@@ -313,8 +514,11 @@ with gr.Blocks(title="ALPHA AI") as app:
     with gr.Tab("Chat"):
 
         gr.ChatInterface(
+
             fn=alpha_chat,
+
             title="Alpha AI Chatbot",
+
             description="Ask Alpha AI anything."
         )
 
@@ -344,8 +548,11 @@ with gr.Blocks(title="ALPHA AI") as app:
         image_status = gr.Markdown()
 
         image_button.click(
+
             fn=generate_image,
+
             inputs=image_prompt,
+
             outputs=[
                 image_output,
                 image_status
@@ -381,11 +588,14 @@ with gr.Blocks(title="ALPHA AI") as app:
         )
 
         analyze_button.click(
+
             fn=analyze_video,
+
             inputs=[
                 video_input,
                 video_question
             ],
+
             outputs=analysis_output
         )
 
@@ -414,8 +624,11 @@ with gr.Blocks(title="ALPHA AI") as app:
         video_status = gr.Markdown()
 
         generate_video_button.click(
+
             fn=generate_video,
+
             inputs=video_prompt,
+
             outputs=[
                 generated_video,
                 video_status
@@ -436,4 +649,4 @@ app.launch(
     server_port=int(
         os.environ.get("PORT", 10000)
     )
-        )
+)
