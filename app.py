@@ -20,7 +20,7 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-CHAT_MODEL = "gemini-3.1-flash-lite"
+CHAT_MODEL = "gemini-3.5-flash-lite"
 IMAGE_MODEL = "gemini-nano-banana-2.1"
 
 
