@@ -143,6 +143,7 @@ def analyze_video(video, question):
 def generate_video(prompt):
 
     output_path = None
+    start_time = time.time()
 
     try:
         if not prompt or not prompt.strip():
@@ -152,53 +153,55 @@ def generate_video(prompt):
 
         interaction = client.interactions.create(
             model=VIDEO_MODEL,
-            input=prompt.strip(),
+            input=(
+                "Create a short cinematic video. "
+                + prompt.strip()
+            ),
             response_format={
                 "type": "video",
                 "aspect_ratio": "16:9",
-                "delivery": "uri"
+                "resolution": "360p"
             }
         )
 
         video_output = interaction.output_video
 
-        if not video_output or not video_output.uri:
-            return None, "No video was returned."
+        if not video_output or not video_output.data:
+            return None, "No video data returned by Gemini."
 
-        file_name = video_output.uri.split("/")[-1]
+        # Decode generated video
 
-        print("Video generated. Waiting for processing...")
-
-        start_time = time.time()
-
-        while True:
-
-            video_file = client.files.get(
-                name=f"files/{file_name}"
-            )
-
-            if video_file.state.name == "ACTIVE":
-                break
-
-            if video_file.state.name == "FAILED":
-                return None, "Video processing failed."
-
-            if time.time() - start_time > 600:
-                return None, "Video processing timed out."
-
-            time.sleep(5)
-
-        output_path = tempfile.NamedTemporaryFile(
-            suffix=".mp4",
-            delete=False
-        ).name
-
-        client.files.download(
-            file=video_output.uri,
-            destination=output_path
+        video_bytes = base64.b64decode(
+            video_output.data
         )
 
-        return output_path, "Video generated successfully!"
+        # Save video as MP4
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp4",
+            delete=False
+        ) as output_file:
+
+            output_file.write(video_bytes)
+            output_path = output_file.name
+
+        elapsed = time.time() - start_time
+
+        print(
+            f"Video generated in {elapsed:.2f} seconds."
+        )
+
+        if elapsed <= 60:
+            status = (
+                f"Video generated in {elapsed:.2f} seconds!"
+            )
+        else:
+            status = (
+                f"Video generated in {elapsed:.2f} seconds. "
+                "The 60-second target was exceeded."
+            )
+
+        return output_path, status
 
     except Exception as e:
 
@@ -218,7 +221,8 @@ with gr.Blocks(title="ALPHA AI") as app:
         # ALPHA AI
         ### Think Beyond Limits
 
-        Your AI assistant for chat, image creation and video creation.
+        Your AI assistant for chat, image creation
+        and video creation.
         """
     )
 
@@ -258,14 +262,19 @@ with gr.Blocks(title="ALPHA AI") as app:
         image_button.click(
             fn=generate_image,
             inputs=image_prompt,
-            outputs=[image_output, image_status]
+            outputs=[
+                image_output,
+                image_status
+            ]
         )
 
     # VIDEO ANALYZER
 
     with gr.Tab("Video Analyzer"):
 
-        gr.Markdown("### Upload a video and ask Alpha AI")
+        gr.Markdown(
+            "### Upload a video and ask Alpha AI"
+        )
 
         video_input = gr.Video(
             label="Upload Video",
@@ -289,7 +298,10 @@ with gr.Blocks(title="ALPHA AI") as app:
 
         analyze_button.click(
             fn=analyze_video,
-            inputs=[video_input, video_question],
+            inputs=[
+                video_input,
+                video_question
+            ],
             outputs=analysis_output
         )
 
@@ -297,11 +309,16 @@ with gr.Blocks(title="ALPHA AI") as app:
 
     with gr.Tab("Video Generator"):
 
-        gr.Markdown("### Create videos using AI")
+        gr.Markdown(
+            "### Create videos using AI"
+        )
 
         video_prompt = gr.Textbox(
             label="Video Description",
-            placeholder="A cinematic view of Saturn rotating in space..."
+            placeholder=(
+                "A cinematic view of Saturn "
+                "rotating in space..."
+            )
         )
 
         generate_video_button = gr.Button(
@@ -333,5 +350,7 @@ app.queue()
 
 app.launch(
     server_name="0.0.0.0",
-    server_port=int(os.environ.get("PORT", 10000))
-        )
+    server_port=int(
+        os.environ.get("PORT", 10000)
+    )
+)
