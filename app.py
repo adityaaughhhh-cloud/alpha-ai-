@@ -1,6 +1,7 @@
 import os
 import base64
 import io
+import time
 import gradio as gr
 
 from PIL import Image
@@ -24,41 +25,65 @@ IMAGE_MODEL = "gemini-nano-banana-2.1"
 
 
 # -----------------------------
-# ALPHA AI CHATBOT
+# CHATBOT WITH AUTOMATIC RETRY
 # -----------------------------
 
 def alpha_chat(message, history):
 
-    try:
-        if not message or not message.strip():
-            yield "Please enter a message."
-            return
+    if not message or not message.strip():
+        return "Please enter a message."
 
-        answer = ""
+    for attempt in range(3):
 
-        stream = client.models.generate_content_stream(
-            model=CHAT_MODEL,
-            contents=message,
-            config=types.GenerateContentConfig(
-                max_output_tokens=512,
-                temperature=0.7
+        try:
+            response = client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=message,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=1024,
+                    temperature=0.7
+                )
             )
-        )
 
-        for chunk in stream:
-            if chunk.text:
-                answer += chunk.text
-                yield answer
+            if response.text:
+                return response.text
 
-        if not answer:
-            yield "Alpha couldn't generate a response."
+            return "Alpha couldn't generate a response."
 
-    except Exception as e:
-        print("CHAT ERROR:", repr(e))
-        yield f"Alpha AI Error: {str(e)}"
+        except Exception as e:
+
+            print("CHAT ERROR:", repr(e))
+
+            error_text = str(e).upper()
+            error_code = getattr(e, "code", None)
+
+            temporary_error = (
+                error_code in (503, 429)
+                or "503" in error_text
+                or "429" in error_text
+                or "UNAVAILABLE" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text
+            )
+
+            if temporary_error and attempt < 2:
+                wait_time = 2 ** (attempt + 1)
+                print(f"Retrying Alpha AI in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+
+            if temporary_error:
+                return (
+                    "Alpha AI is experiencing high demand. "
+                    "Please try again shortly."
+                )
+
+            return "Alpha AI encountered an error. Please try again."
+
+    return "Alpha AI is temporarily unavailable."
+
 
 # -----------------------------
-# ALPHA AI IMAGE GENERATOR
+# IMAGE GENERATOR
 # -----------------------------
 
 def generate_image(prompt):
@@ -80,7 +105,7 @@ def generate_image(prompt):
         generated = interaction.output_image
 
         if not generated or not generated.data:
-            return None, "No image was returned by Gemini."
+            return None, "No image was returned."
 
         image_bytes = base64.b64decode(generated.data)
 
@@ -94,10 +119,7 @@ def generate_image(prompt):
 
         print("IMAGE ERROR:", repr(e))
 
-        return None, (
-            "Image generation failed. "
-            "Please check the Render logs or try again."
-        )
+        return None, "Image generation failed. Please try again."
 
 
 # -----------------------------
@@ -110,6 +132,7 @@ with gr.Blocks(title="ALPHA AI") as app:
         """
         # ALPHA AI
         ### Think Beyond Limits
+
         Your AI assistant for questions and image creation.
         """
     )
@@ -124,9 +147,7 @@ with gr.Blocks(title="ALPHA AI") as app:
 
     with gr.Tab("Image Creator"):
 
-        gr.Markdown(
-            "### Create images using artificial intelligence"
-        )
+        gr.Markdown("### Create images using artificial intelligence")
 
         prompt = gr.Textbox(
             label="Image Description",
@@ -161,4 +182,4 @@ app.queue()
 app.launch(
     server_name="0.0.0.0",
     server_port=int(os.environ.get("PORT", 10000))
-        )
+)
