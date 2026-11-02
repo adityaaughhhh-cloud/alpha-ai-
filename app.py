@@ -43,7 +43,7 @@ CHAT_MODEL = "gemini-3.5-flash-lite"
 
 BACKUP_MODEL = "gemini-3.1-flash-lite"
 
-IMAGE_MODEL = "gemini-3.1-flash-lite-image"
+IMAGE_MODEL = "gemini-3.1-flash-image"
 
 VIDEO_MODEL = "gemini-omni-1.1-flash"
 
