@@ -504,6 +504,102 @@ def get_file_state(video_file):
         str(state)
     ).upper()
 
+# ==================================================
+# IMAGE ANALYZER
+# ==================================================
+
+def analyze_image(image_path, question):
+
+    if not image_path:
+        return "Please upload an image first."
+
+    if not question or not question.strip():
+        question = "Describe this image in detail."
+
+    try:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+            image.thumbnail((1800, 1800))
+
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=90)
+
+            image_bytes = buffer.getvalue()
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg"
+        )
+
+        text_part = types.Part.from_text(
+            text=question
+        )
+
+        response = run_with_retries(
+            lambda: client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            image_part,
+                            text_part
+                        ]
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    temperature=0.3
+                )
+            )
+        )
+
+        return response.text or "No image analysis generated."
+
+    except Exception as error:
+        logger.exception("IMAGE ANALYSIS FAILED")
+        return error_message(error)
+
+# IMAGE ANALYZER
+
+with gr.Tab("Image Analyzer"):
+
+    gr.Markdown(
+        """
+        ## 📷 Upload an Image
+
+        Send a photo to Alpha AI and ask questions about it.
+        """
+    )
+
+    image_input = gr.File(
+        label="Choose or Upload Image",
+        file_types=["image"],
+        type="filepath"
+    )
+
+    image_question = gr.Textbox(
+        label="Ask Alpha AI",
+        placeholder="Describe this image...",
+        lines=2
+    )
+
+    image_button = gr.Button(
+        "Analyze Image",
+        variant="primary"
+    )
+
+    image_result = gr.Markdown()
+
+    image_button.click(
+        fn=analyze_image,
+        inputs=[
+            image_input,
+            image_question
+        ],
+        outputs=image_result
+    )
+
 
 # ==================================================
 # 3. VIDEO ANALYZER
