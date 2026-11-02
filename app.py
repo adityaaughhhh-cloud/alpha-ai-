@@ -53,9 +53,9 @@ VIDEO_MODEL = "gemini-omni-1.1-flash"
 # PERFORMANCE SETTINGS
 # ==================================================
 
-MAX_OUTPUT_TOKENS = 5000
+MAX_OUTPUT_TOKENS = 2000
 
-CHAT_HISTORY_LIMIT = 4
+CHAT_HISTORY_LIMIT = 2
 
 VIDEO_PROCESSING_TIMEOUT = 300
 
