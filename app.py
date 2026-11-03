@@ -6,7 +6,6 @@ import tempfile
 import logging
 import sqlite3
 import threading
-import uuid
 from datetime import date
 
 import gradio as gr
@@ -18,11 +17,9 @@ from google.genai import types
 
 # =====================================================
 # ALPHA AI 4.0
-# CHATGPT STYLE EDITION
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger("ALPHA")
 
 
@@ -56,13 +53,10 @@ VIDEO_MODEL = os.environ.get(
 )
 
 MAX_OUTPUT_TOKENS = 1024
-
 CHAT_HISTORY_LIMIT = 6
-
 IMAGE_DAILY_LIMIT = 20
 
 VIDEO_TIMEOUT = 600
-
 VIDEO_POLL_INTERVAL = 5
 
 DB_PATH = "alpha_usage.db"
@@ -123,7 +117,6 @@ def initialize_database():
         """)
 
         connection.commit()
-
         connection.close()
 
 
@@ -204,44 +197,21 @@ def get_error(error):
     logger.exception("ALPHA ERROR")
 
     if "429" in message or "quota" in message:
-
-        return (
-            "API quota reached. "
-            "Please try again after the quota resets."
-        )
+        return "API quota reached. Please try again later."
 
     if "503" in message or "overloaded" in message:
-
-        return (
-            "Alpha AI is experiencing high demand. "
-            "Please try again shortly."
-        )
+        return "Alpha AI is experiencing high demand. Please try again shortly."
 
     if "404" in message:
-
-        return (
-            "The selected AI model is unavailable. "
-            "Check your model configuration."
-        )
+        return "The selected AI model is unavailable. Check model configuration."
 
     if "403" in message:
-
-        return (
-            "API access denied. "
-            "Check your Google API permissions."
-        )
+        return "API access denied. Check your Google API permissions."
 
     if "timeout" in message:
+        return "The request took too long. Please try again."
 
-        return (
-            "The request took too long. "
-            "Please try again."
-        )
-
-    return (
-        "Alpha AI could not complete your request. "
-        "Please try again later."
-    )
+    return "Alpha AI could not complete your request. Please try again."
 
 
 # =====================================================
@@ -258,7 +228,6 @@ def prepare_history(history):
             continue
 
         role = item.get("role")
-
         content = item.get("content")
 
         if role not in ["user", "assistant"]:
@@ -272,15 +241,9 @@ def prepare_history(history):
 
         contents.append(
             types.Content(
-                role=(
-                    "user"
-                    if role == "user"
-                    else "model"
-                ),
+                role="user" if role == "user" else "model",
                 parts=[
-                    types.Part.from_text(
-                        text=content
-                    )
+                    types.Part.from_text(text=content)
                 ]
             )
         )
@@ -295,16 +258,14 @@ def prepare_history(history):
 def alpha_chat(message, history):
 
     if not message or not message.strip():
-
         yield "Please enter a message."
-
         return
 
     start = time.monotonic()
 
-    history_contents = prepare_history(history)
+    contents = prepare_history(history)
 
-    contents = history_contents + [
+    contents.append(
         types.Content(
             role="user",
             parts=[
@@ -313,12 +274,9 @@ def alpha_chat(message, history):
                 )
             ]
         )
-    ]
+    )
 
-    models = [
-        CHAT_MODEL,
-        BACKUP_MODEL
-    ]
+    models = [CHAT_MODEL, BACKUP_MODEL]
 
     for index, model in enumerate(models):
 
@@ -326,10 +284,7 @@ def alpha_chat(message, history):
 
         try:
 
-            logger.info(
-                "CHAT MODEL: %s",
-                model
-            )
+            logger.info("CHAT MODEL: %s", model)
 
             config = types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
@@ -348,7 +303,6 @@ def alpha_chat(message, history):
                 if chunk.text:
 
                     answer += chunk.text
-
                     yield answer
 
             if answer:
@@ -363,34 +317,22 @@ def alpha_chat(message, history):
                 return
 
             yield "No response generated."
-
             return
 
         except Exception as error:
 
             logger.exception("CHAT ERROR")
 
-            # Do not repeat an already streamed answer.
-
             if answer:
 
-                yield (
-                    answer
-                    + "\n\nConnection interrupted."
-                )
-
+                yield answer + "\n\nConnection interrupted."
                 return
 
             if index == 0:
-
-                logger.info(
-                    "Trying backup model."
-                )
-
+                logger.info("Trying backup model.")
                 continue
 
             yield get_error(error)
-
             return
 
 
@@ -401,11 +343,9 @@ def alpha_chat(message, history):
 def analyze_image(image_path, question):
 
     if not image_path:
-
         return "Please upload an image."
 
     if not question or not question.strip():
-
         question = "Describe this image clearly."
 
     start = time.monotonic()
@@ -415,10 +355,7 @@ def analyze_image(image_path, question):
         with Image.open(image_path) as source:
 
             image = source.convert("RGB")
-
-            image.thumbnail(
-                (1400, 1400)
-            )
+            image.thumbnail((1400, 1400))
 
             buffer = io.BytesIO()
 
@@ -461,10 +398,7 @@ def analyze_image(image_path, question):
 
         elapsed = time.monotonic() - start
 
-        return (
-            answer
-            + f"\n\nAnalysis time: {elapsed:.2f} seconds."
-        )
+        return answer + f"\n\nAnalysis time: {elapsed:.2f} seconds."
 
     except Exception as error:
 
@@ -478,7 +412,6 @@ def analyze_image(image_path, question):
 def generate_image(prompt, request: gr.Request):
 
     if not prompt or not prompt.strip():
-
         return None, "Enter an image description."
 
     session_id = (
@@ -491,19 +424,13 @@ def generate_image(prompt, request: gr.Request):
 
     if used >= IMAGE_DAILY_LIMIT:
 
-        return (
-            None,
-            "Daily image limit reached. "
-            "You can generate more images tomorrow."
-        )
+        return None, "Daily image limit reached."
 
     start = time.monotonic()
 
     try:
 
         logger.info("IMAGE GENERATION STARTED")
-
-        # Correct Gemini image generation API.
 
         response = client.models.generate_content(
             model=IMAGE_MODEL,
@@ -520,18 +447,11 @@ def generate_image(prompt, request: gr.Request):
             if part.inline_data:
 
                 generated_image = part.as_image()
-
                 break
 
         if generated_image is None:
 
-            return (
-                None,
-                "The image model returned no image. "
-                "Please try another prompt."
-            )
-
-        # Validate the image.
+            return None, "The image model returned no image."
 
         output = io.BytesIO()
 
@@ -543,17 +463,10 @@ def generate_image(prompt, request: gr.Request):
         output.seek(0)
 
         with Image.open(output) as check:
-
             check.verify()
 
-        # Count only successful generations.
-
         if not consume_image_credit(session_id):
-
-            return (
-                None,
-                "Daily image limit reached."
-            )
+            return None, "Daily image limit reached."
 
         used = get_image_usage(session_id)
 
@@ -585,17 +498,12 @@ def generate_image(prompt, request: gr.Request):
 def analyze_video(video_path, question):
 
     if not video_path:
-
         return "Please upload a video."
 
     if not question or not question.strip():
-
-        question = (
-            "Explain what happens in this video."
-        )
+        question = "Explain what happens in this video."
 
     video_file = None
-
     start = time.monotonic()
 
     try:
@@ -605,8 +513,6 @@ def analyze_video(video_path, question):
         video_file = client.files.upload(
             file=video_path
         )
-
-        # Wait until the video is ready.
 
         processing_start = time.monotonic()
 
@@ -623,23 +529,15 @@ def analyze_video(video_path, question):
             ).upper()
 
             if state == "ACTIVE":
-
                 break
 
             if state == "FAILED":
-
                 return "Video processing failed."
 
-            if (
-                time.monotonic() - processing_start
-                > VIDEO_TIMEOUT
-            ):
-
+            if time.monotonic() - processing_start > VIDEO_TIMEOUT:
                 return "Video processing timed out."
 
             time.sleep(3)
-
-        # Use the video URI with Gemini.
 
         interaction = client.interactions.create(
             model=CHAT_MODEL,
@@ -663,15 +561,11 @@ def analyze_video(video_path, question):
         )
 
         if not answer:
-
             answer = "No video analysis generated."
 
         elapsed = time.monotonic() - start
 
-        return (
-            answer
-            + f"\n\nAnalysis time: {elapsed:.2f} seconds."
-        )
+        return answer + f"\n\nAnalysis time: {elapsed:.2f} seconds."
 
     except Exception as error:
 
@@ -682,37 +576,29 @@ def analyze_video(video_path, question):
         if video_file:
 
             try:
-
                 client.files.delete(
                     name=video_file.name
                 )
 
             except Exception:
-
-                logger.warning(
-                    "VIDEO CLEANUP FAILED"
-                )
+                logger.warning("VIDEO CLEANUP FAILED")
 
 
 # =====================================================
-# 5. VIDEO GENERATION
+# 5. VIDEO GENERATION - 360P ONLY
 # =====================================================
 
 def generate_video(prompt):
 
     if not prompt or not prompt.strip():
-
         return None, "Enter a video description."
 
     output_path = None
-
     start = time.monotonic()
 
     try:
 
         logger.info("VIDEO GENERATION STARTED")
-
-        # Gemini Omni video generation.
 
         interaction = client.interactions.create(
             model=VIDEO_MODEL,
@@ -720,7 +606,7 @@ def generate_video(prompt):
             response_format={
                 "type": "video",
                 "aspect_ratio": "16:9",
-                "resolution": "720p",
+                "resolution": "360p",
                 "delivery": "uri"
             }
         )
@@ -732,11 +618,7 @@ def generate_video(prompt):
         )
 
         if video_output is None:
-
-            return (
-                None,
-                "The video model returned no video."
-            )
+            return None, "The video model returned no video."
 
         video_uri = getattr(
             video_output,
@@ -747,10 +629,7 @@ def generate_video(prompt):
         if video_uri:
 
             file_id = video_uri.split("/")[-1]
-
-            file_name = (
-                file_id.split("?")[0]
-            )
+            file_name = file_id.split("?")[0]
 
             processing_start = time.monotonic()
 
@@ -767,29 +646,15 @@ def generate_video(prompt):
                 ).upper()
 
                 if state == "ACTIVE":
-
                     break
 
                 if state == "FAILED":
+                    return None, "Video generation failed."
 
-                    return (
-                        None,
-                        "Video generation failed."
-                    )
+                if time.monotonic() - processing_start > VIDEO_TIMEOUT:
+                    return None, "Video processing timed out."
 
-                if (
-                    time.monotonic() - processing_start
-                    > VIDEO_TIMEOUT
-                ):
-
-                    return (
-                        None,
-                        "Video processing timed out."
-                    )
-
-                time.sleep(
-                    VIDEO_POLL_INTERVAL
-                )
+                time.sleep(VIDEO_POLL_INTERVAL)
 
             with tempfile.NamedTemporaryFile(
                 suffix=".mp4",
@@ -812,15 +677,9 @@ def generate_video(prompt):
             )
 
             if not video_data:
+                return None, "No video data was returned."
 
-                return (
-                    None,
-                    "No video data was returned."
-                )
-
-            video_bytes = base64.b64decode(
-                video_data
-            )
+            video_bytes = base64.b64decode(video_data)
 
             with tempfile.NamedTemporaryFile(
                 suffix=".mp4",
@@ -828,7 +687,6 @@ def generate_video(prompt):
             ) as output:
 
                 output.write(video_bytes)
-
                 output_path = output.name
 
         elapsed = time.monotonic() - start
@@ -840,7 +698,7 @@ def generate_video(prompt):
 
         return (
             output_path,
-            f"Video generated successfully in {elapsed:.2f} seconds."
+            f"360p video generated in {elapsed:.2f} seconds."
         )
 
     except Exception as error:
@@ -848,18 +706,15 @@ def generate_video(prompt):
         if output_path and os.path.exists(output_path):
 
             try:
-
                 os.remove(output_path)
-
             except OSError:
-
                 pass
 
         return None, get_error(error)
 
 
 # =====================================================
-# 6. CUSTOM DESIGN
+# 6. DESIGN
 # =====================================================
 
 CSS = """
@@ -901,16 +756,12 @@ textarea {
 
 
 # =====================================================
-# 7. ALPHA AI INTERFACE
+# 7. ALPHA INTERFACE
+# GRADIO 6 COMPATIBLE
 # =====================================================
 
 with gr.Blocks(
-    title="ALPHA AI",
-    theme=gr.themes.Soft(
-        primary_hue="blue",
-        secondary_hue="slate"
-    ),
-    css=CSS
+    title="ALPHA AI"
 ) as app:
 
     gr.HTML(
@@ -925,9 +776,7 @@ with gr.Blocks(
 
     with gr.Tabs():
 
-        # ---------------------------------------------
         # CHAT
-        # ---------------------------------------------
 
         with gr.Tab("💬 Chat"):
 
@@ -935,13 +784,9 @@ with gr.Blocks(
                 fn=alpha_chat,
                 type="messages",
                 title="Alpha AI",
-                description=(
-                    "Ask anything. "
-                    "Get fast and intelligent answers."
-                ),
+                description="Ask anything. Get fast and intelligent answers.",
                 chatbot=gr.Chatbot(
-                    height=530,
-                    type="messages"
+                    height=530
                 ),
                 textbox=gr.Textbox(
                     placeholder="Message Alpha AI...",
@@ -954,15 +799,11 @@ with gr.Blocks(
                 undo_btn="Undo"
             )
 
-        # ---------------------------------------------
-        # IMAGE ANALYZER
-        # ---------------------------------------------
+        # IMAGE ANALYSIS
 
         with gr.Tab("🖼️ Image Analysis"):
 
-            gr.Markdown(
-                "## Understand any image"
-            )
+            gr.Markdown("## Understand any image")
 
             image_input = gr.Image(
                 label="Upload Image",
@@ -990,9 +831,7 @@ with gr.Blocks(
                 outputs=image_analysis_output
             )
 
-        # ---------------------------------------------
-        # IMAGE GENERATOR
-        # ---------------------------------------------
+        # IMAGE CREATOR
 
         with gr.Tab("🎨 Image Creator"):
 
@@ -1008,10 +847,7 @@ with gr.Blocks(
 
             image_prompt = gr.Textbox(
                 label="Describe your image",
-                placeholder=(
-                    "A futuristic city on Mars "
-                    "with flying vehicles..."
-                ),
+                placeholder="A futuristic city on Mars with flying vehicles...",
                 lines=3
             )
 
@@ -1036,19 +872,11 @@ with gr.Blocks(
                 ]
             )
 
-        # ---------------------------------------------
-        # VIDEO ANALYZER
-        # ---------------------------------------------
+        # VIDEO ANALYSIS
 
         with gr.Tab("🎬 Video Analysis"):
 
-            gr.Markdown(
-                """
-                ## Understand Videos
-
-                Upload a video and ask questions about it.
-                """
-            )
+            gr.Markdown("## Understand Videos")
 
             video_input = gr.Video(
                 label="Upload Video",
@@ -1057,9 +885,7 @@ with gr.Blocks(
 
             video_question = gr.Textbox(
                 label="Ask Alpha",
-                placeholder=(
-                    "Explain what happens in this video."
-                )
+                placeholder="Explain what happens in this video."
             )
 
             video_analyze_button = gr.Button(
@@ -1078,9 +904,7 @@ with gr.Blocks(
                 outputs=video_analysis_output
             )
 
-        # ---------------------------------------------
-        # VIDEO GENERATOR
-        # ---------------------------------------------
+        # VIDEO CREATOR
 
         with gr.Tab("🎥 Video Creator"):
 
@@ -1090,16 +914,13 @@ with gr.Blocks(
 
                 Generate videos from text descriptions.
 
-                Generation time depends on model demand.
+                Resolution: 360p
                 """
             )
 
             video_prompt = gr.Textbox(
                 label="Describe your video",
-                placeholder=(
-                    "A cinematic view of Saturn "
-                    "rotating in deep space..."
-                ),
+                placeholder="A cinematic view of Saturn rotating in deep space...",
                 lines=3
             )
 
@@ -1153,12 +974,15 @@ if __name__ == "__main__":
         os.environ.get("PORT", "10000")
     )
 
-    logger.info(
-        "STARTING ALPHA AI 4.0"
-    )
+    logger.info("STARTING ALPHA AI 4.0")
 
     app.launch(
         server_name="0.0.0.0",
         server_port=PORT,
+        theme=gr.themes.Soft(
+            primary_hue="blue",
+            secondary_hue="slate"
+        ),
+        css=CSS,
         show_error=False
-        )
+            )
