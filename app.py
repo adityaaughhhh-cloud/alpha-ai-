@@ -14,7 +14,7 @@ from google.genai import types
 
 
 # ==================================================
-# ALPHA AI 3.6 - IMAGE ANALYSIS EDITION
+# ALPHA AI 3.7 - SPEED & STABILITY EDITION
 # ==================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -28,9 +28,7 @@ logger = logging.getLogger("ALPHA")
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is missing in Render environment variables."
-    )
+    raise RuntimeError("GEMINI_API_KEY is missing.")
 
 client = genai.Client(api_key=API_KEY)
 
@@ -41,7 +39,10 @@ client = genai.Client(api_key=API_KEY)
 
 CHAT_MODEL = "gemini-3.5-flash-lite"
 BACKUP_MODEL = "gemini-3.1-flash-lite"
-IMAGE_MODEL = "gemini-3.1-flash-lite-image"
+
+# Updated image model
+IMAGE_MODEL = "gemini-3.1-flash-image"
+
 VIDEO_MODEL = "gemini-omni-1.1-flash"
 
 
@@ -49,17 +50,21 @@ VIDEO_MODEL = "gemini-omni-1.1-flash"
 # PERFORMANCE SETTINGS
 # ==================================================
 
-MAX_OUTPUT_TOKENS = 5000
+MAX_OUTPUT_TOKENS = 2048
+
 CHAT_HISTORY_LIMIT = 4
+
 VIDEO_PROCESSING_TIMEOUT = 300
 VIDEO_POLL_INTERVAL = 3
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2
+
+MAX_RETRIES = 2
+RETRY_BASE_DELAY = 1
+
+IMAGE_TIMEOUT = 40
 
 SYSTEM_INSTRUCTION = """
 You are Alpha AI, an intelligent AI assistant.
 
-Instructions:
 1. Answer accurately.
 2. Keep simple answers short.
 3. Explain difficult questions clearly.
@@ -77,53 +82,82 @@ Instructions:
 # ==================================================
 
 def get_error_details(error):
+
     message = str(error)
-    logger.error("API ERROR DETAILS: %s", message)
+
+    logger.error("API ERROR: %s", message)
+
     return message
 
 
 def is_temporary_error(error):
+
     message = str(error).lower()
 
-    temporary_errors = [
-        "429", "500", "502", "503", "504",
-        "resource_exhausted", "rate limit",
-        "unavailable", "overloaded",
-        "internal server error", "timeout",
-        "temporarily unavailable"
+    terms = [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "resource_exhausted",
+        "rate limit",
+        "unavailable",
+        "overloaded",
+        "timeout",
+        "temporarily unavailable",
+        "internal server error"
     ]
 
-    return any(item in message for item in temporary_errors)
+    return any(term in message for term in terms)
 
 
 def is_quota_error(error):
+
     message = str(error).lower()
 
-    quota_terms = [
-        "quota exceeded", "daily limit",
-        "per day", "billing", "limit: 0",
+    terms = [
+        "quota exceeded",
+        "daily limit",
+        "billing",
+        "limit: 0",
         "free_tier"
     ]
 
-    return any(item in message for item in quota_terms)
+    return any(term in message for term in terms)
 
 
 def error_message(error):
-    get_error_details(error)
+
+    message = get_error_details(error)
 
     if is_quota_error(error):
+
         return (
-            "Alpha AI API quota has been reached. "
+            "Alpha AI API quota reached. "
             "Please try again after the quota resets."
         )
 
     if is_temporary_error(error):
+
         return (
-            "Alpha AI is temporarily experiencing high demand. "
+            "Alpha AI is experiencing high demand. "
             "Please try again shortly."
         )
 
-    logger.exception("ALPHA REQUEST FAILED")
+    if "404" in message:
+
+        return (
+            "The requested AI model is unavailable "
+            "for this API key."
+        )
+
+    if "403" in message:
+
+        return (
+            "API access was denied. "
+            "Please check API permissions."
+        )
 
     return (
         "Alpha AI could not complete your request. "
@@ -132,28 +166,33 @@ def error_message(error):
 
 
 # ==================================================
-# RETRY HELPER
+# RETRY SYSTEM
 # ==================================================
 
 def retry_delay(attempt):
-    delay = RETRY_BASE_DELAY * (2 ** attempt)
-    return delay + random.uniform(0, 1)
+
+    return RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(
+        0, 0.5
+    )
 
 
-def run_with_retries(function):
+def run_with_retries(function, retries=MAX_RETRIES):
+
     last_error = None
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(retries):
+
         try:
+
             return function()
 
         except Exception as error:
+
             last_error = error
 
             logger.warning(
-                "REQUEST FAILED: attempt %s/%s: %s",
+                "Attempt %s failed: %s",
                 attempt + 1,
-                MAX_RETRIES,
                 error
             )
 
@@ -161,24 +200,26 @@ def run_with_retries(function):
                 not is_temporary_error(error)
                 or is_quota_error(error)
             ):
+
                 raise
 
-            if attempt < MAX_RETRIES - 1:
-                delay = retry_delay(attempt)
-                logger.info("RETRYING IN %.2f SECONDS", delay)
-                time.sleep(delay)
+            if attempt < retries - 1:
+
+                time.sleep(retry_delay(attempt))
 
     raise last_error
 
 
 # ==================================================
-# CHAT HISTORY PROCESSING
+# CHAT HISTORY
 # ==================================================
 
 def prepare_chat_contents(message, history):
+
     contents = []
 
     for item in (history or [])[-CHAT_HISTORY_LIMIT:]:
+
         if not isinstance(item, dict):
             continue
 
@@ -189,6 +230,7 @@ def prepare_chat_contents(message, history):
             continue
 
         if isinstance(content, str) and content.strip():
+
             contents.append(
                 types.Content(
                     role="user" if role == "user" else "model",
@@ -211,12 +253,15 @@ def prepare_chat_contents(message, history):
 
 
 # ==================================================
-# 1. ALPHA AI CHAT
+# 1. CHAT
 # ==================================================
 
 def alpha_chat(message, history):
+
     if not message or not message.strip():
+
         yield "Please enter a message."
+
         return
 
     start = time.monotonic()
@@ -226,12 +271,12 @@ def alpha_chat(message, history):
         history
     )
 
-    models = [CHAT_MODEL, BACKUP_MODEL]
+    for model in [CHAT_MODEL, BACKUP_MODEL]:
 
-    for index, model in enumerate(models):
         answer = ""
 
         try:
+
             logger.info("CHAT MODEL: %s", model)
 
             config = types.GenerateContentConfig(
@@ -248,104 +293,89 @@ def alpha_chat(message, history):
                 )
             )
 
-            first_token = None
-
             for chunk in stream:
-                if chunk.text:
-                    if first_token is None:
-                        first_token = time.monotonic()
 
-                        logger.info(
-                            "FIRST TOKEN TIME: %.3f seconds",
-                            first_token - start
-                        )
+                if chunk.text:
 
                     answer += chunk.text
+
                     yield answer
 
-            elapsed = time.monotonic() - start
-
             logger.info(
-                "CHAT TOTAL TIME: %.2f seconds",
-                elapsed
+                "CHAT TIME: %.2f seconds",
+                time.monotonic() - start
             )
 
             if not answer:
+
                 yield "No response generated."
 
             return
 
         except Exception as error:
-            logger.exception("CHAT MODEL FAILED: %s", model)
+
+            logger.exception("CHAT ERROR")
 
             if answer:
+
                 yield answer + "\n\nConnection interrupted."
+
                 return
 
-            if (
-                index == 0
-                and is_temporary_error(error)
-                and not is_quota_error(error)
-            ):
-                logger.warning("SWITCHING TO BACKUP MODEL")
+            if model == CHAT_MODEL and is_temporary_error(error):
+
                 continue
 
             yield error_message(error)
+
             return
 
 
 # ==================================================
-# 2. IMAGE ANALYZER - NEW FEATURE
+# 2. IMAGE ANALYZER
 # ==================================================
 
 def analyze_image(image_path, question):
 
     if not image_path:
-        return "Please upload an image first."
+
+        return "Please upload an image."
 
     if not question or not question.strip():
-        question = (
-            "Describe this image clearly. Identify the objects, "
-            "scene, readable text, and important details."
-        )
+
+        question = "Describe this image clearly."
 
     start = time.monotonic()
 
     try:
-        logger.info("IMAGE ANALYSIS STARTED")
 
-        # Open and prepare uploaded image.
         with Image.open(image_path) as source:
 
             image = source.convert("RGB")
-            image.thumbnail((1800, 1800))
+
+            image.thumbnail((1600, 1600))
 
             buffer = io.BytesIO()
 
             image.save(
                 buffer,
                 format="JPEG",
-                quality=90
+                quality=85
             )
 
             image_bytes = buffer.getvalue()
-
-        # Convert image into Gemini-compatible input.
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type="image/jpeg"
-        )
-
-        question_part = types.Part.from_text(
-            text=question.strip()
-        )
 
         contents = [
             types.Content(
                 role="user",
                 parts=[
-                    image_part,
-                    question_part
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg"
+                    ),
+                    types.Part.from_text(
+                        text=question.strip()
+                    )
                 ]
             )
         ]
@@ -353,11 +383,11 @@ def analyze_image(image_path, question):
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.3,
-            max_output_tokens=MAX_OUTPUT_TOKENS
+            max_output_tokens=2048
         )
 
-        # Try primary model, then backup model if temporarily unavailable.
         try:
+
             response = run_with_retries(
                 lambda: client.models.generate_content(
                     model=CHAT_MODEL,
@@ -368,32 +398,21 @@ def analyze_image(image_path, question):
 
         except Exception as primary_error:
 
-            if (
-                is_temporary_error(primary_error)
-                and not is_quota_error(primary_error)
-            ):
-                logger.warning(
-                    "IMAGE ANALYSIS SWITCHING TO BACKUP MODEL"
-                )
+            if not is_temporary_error(primary_error):
 
-                response = run_with_retries(
-                    lambda: client.models.generate_content(
-                        model=BACKUP_MODEL,
-                        contents=contents,
-                        config=config
-                    )
-                )
-            else:
                 raise
 
+            response = run_with_retries(
+                lambda: client.models.generate_content(
+                    model=BACKUP_MODEL,
+                    contents=contents,
+                    config=config
+                )
+            )
+
+        answer = response.text or "No analysis generated."
+
         elapsed = time.monotonic() - start
-
-        logger.info(
-            "IMAGE ANALYSIS TIME: %.2f seconds",
-            elapsed
-        )
-
-        answer = response.text or "No image analysis generated."
 
         return (
             answer
@@ -401,23 +420,30 @@ def analyze_image(image_path, question):
         )
 
     except Exception as error:
-        logger.exception("IMAGE ANALYSIS FAILED")
+
+        logger.exception("IMAGE ANALYSIS ERROR")
+
         return error_message(error)
 
 
 # ==================================================
-# 3. IMAGE GENERATOR
+# 3. FAST IMAGE GENERATOR
 # ==================================================
 
 def generate_image(prompt):
 
     if not prompt or not prompt.strip():
+
         return None, "Please enter an image description."
 
     start = time.monotonic()
 
     try:
+
         logger.info("IMAGE GENERATION STARTED")
+
+        # Use the updated image model.
+        # Request one standard 1K image.
 
         interaction = run_with_retries(
             lambda: client.interactions.create(
@@ -428,8 +454,10 @@ def generate_image(prompt):
                     "mime_type": "image/jpeg",
                     "aspect_ratio": "1:1",
                     "image_size": "1K"
-                }
-            )
+                },
+                timeout=IMAGE_TIMEOUT
+            ),
+            retries=2
         )
 
         generated = getattr(
@@ -438,8 +466,12 @@ def generate_image(prompt):
             None
         )
 
-        if not generated:
-            return None, "No image was returned by the model."
+        if generated is None:
+
+            return (
+                None,
+                "The image model did not return an image."
+            )
 
         image_data = getattr(
             generated,
@@ -448,34 +480,62 @@ def generate_image(prompt):
         )
 
         if not image_data:
-            return None, "Image data is empty."
+
+            return (
+                None,
+                "The generated image data was empty."
+            )
 
         if isinstance(image_data, str):
-            image_bytes = base64.b64decode(image_data)
+
+            image_bytes = base64.b64decode(
+                image_data,
+                validate=True
+            )
+
         else:
+
             image_bytes = image_data
 
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        )
+        if not image_bytes:
 
-        image.load()
-        image = image.convert("RGB")
+            return None, "Invalid image data received."
+
+        # Validate the generated image.
+
+        with Image.open(
+            io.BytesIO(image_bytes)
+        ) as generated_image:
+
+            generated_image.verify()
+
+        # Load validated image.
+
+        with Image.open(
+            io.BytesIO(image_bytes)
+        ) as generated_image:
+
+            image = generated_image.convert("RGB")
 
         elapsed = time.monotonic() - start
 
         logger.info(
-            "IMAGE GENERATION TIME: %.2f seconds",
+            "IMAGE GENERATION COMPLETED: %.2f seconds",
             elapsed
         )
 
         return (
             image,
-            f"Image successfully generated in {elapsed:.2f} seconds."
+            (
+                "Image successfully generated! "
+                f"Time: {elapsed:.2f} seconds."
+            )
         )
 
     except Exception as error:
-        logger.exception("IMAGE GENERATION FAILED")
+
+        logger.exception("IMAGE GENERATION ERROR")
+
         return None, error_message(error)
 
 
@@ -492,6 +552,7 @@ def get_file_state(video_file):
     )
 
     if state is None:
+
         return ""
 
     return getattr(
@@ -508,16 +569,18 @@ def get_file_state(video_file):
 def analyze_video(video, question):
 
     if not video:
+
         return "Please upload a video."
 
     if not question or not question.strip():
+
         question = "Explain what happens in this video."
 
     video_file = None
+
     start = time.monotonic()
 
     try:
-        logger.info("VIDEO ANALYSIS STARTED")
 
         video_file = run_with_retries(
             lambda: client.files.upload(file=video)
@@ -530,15 +593,18 @@ def analyze_video(video, question):
             state = get_file_state(video_file)
 
             if state == "ACTIVE":
+
                 break
 
             if state == "FAILED":
+
                 return "Video processing failed."
 
             if (
                 time.monotonic() - processing_start
                 > VIDEO_PROCESSING_TIMEOUT
             ):
+
                 return "Video processing timed out."
 
             time.sleep(VIDEO_POLL_INTERVAL)
@@ -562,26 +628,30 @@ def analyze_video(video, question):
 
         elapsed = time.monotonic() - start
 
-        logger.info(
-            "VIDEO ANALYSIS TIME: %.2f seconds",
-            elapsed
+        return (
+            (response.text or "No analysis generated.")
+            + f"\n\nAnalysis time: {elapsed:.2f} seconds."
         )
 
-        return response.text or "No analysis generated."
-
     except Exception as error:
-        logger.exception("VIDEO ANALYSIS FAILED")
+
+        logger.exception("VIDEO ANALYSIS ERROR")
+
         return error_message(error)
 
     finally:
 
         if video_file:
+
             try:
+
                 client.files.delete(
                     name=video_file.name
                 )
+
             except Exception:
-                logger.warning("VIDEO FILE CLEANUP FAILED")
+
+                logger.warning("VIDEO CLEANUP FAILED")
 
 
 # ==================================================
@@ -591,13 +661,14 @@ def analyze_video(video, question):
 def generate_video(prompt):
 
     if not prompt or not prompt.strip():
+
         return None, "Please enter a video description."
 
     start = time.monotonic()
+
     output_path = None
 
     try:
-        logger.info("VIDEO GENERATION STARTED")
 
         interaction = run_with_retries(
             lambda: client.interactions.create(
@@ -619,6 +690,7 @@ def generate_video(prompt):
         )
 
         if not video_output:
+
             return None, "No video response received."
 
         video_uri = getattr(
@@ -646,15 +718,18 @@ def generate_video(prompt):
                 state = get_file_state(video_file)
 
                 if state == "ACTIVE":
+
                     break
 
                 if state == "FAILED":
+
                     return None, "Video generation failed."
 
                 if (
                     time.monotonic() - processing_start
                     > VIDEO_PROCESSING_TIMEOUT
                 ):
+
                     return None, "Video processing timed out."
 
                 time.sleep(VIDEO_POLL_INTERVAL)
@@ -680,6 +755,7 @@ def generate_video(prompt):
             )
 
             if not video_data:
+
                 return None, "Video data was not returned."
 
             video_bytes = base64.b64decode(video_data)
@@ -690,14 +766,10 @@ def generate_video(prompt):
             ) as output_file:
 
                 output_file.write(video_bytes)
+
                 output_path = output_file.name
 
         elapsed = time.monotonic() - start
-
-        logger.info(
-            "VIDEO GENERATION TIME: %.2f seconds",
-            elapsed
-        )
 
         return (
             output_path,
@@ -705,12 +777,17 @@ def generate_video(prompt):
         )
 
     except Exception as error:
-        logger.exception("VIDEO GENERATION FAILED")
+
+        logger.exception("VIDEO GENERATION ERROR")
 
         if output_path and os.path.exists(output_path):
+
             try:
+
                 os.remove(output_path)
+
             except OSError:
+
                 pass
 
         return None, error_message(error)
@@ -737,9 +814,7 @@ with gr.Blocks(
         """
     )
 
-    # ------------------------------------------------
-    # CHAT TAB
-    # ------------------------------------------------
+    # CHAT
 
     with gr.Tab("Chat"):
 
@@ -749,22 +824,12 @@ with gr.Blocks(
             description="Ask Alpha AI anything."
         )
 
-    # ------------------------------------------------
-    # IMAGE ANALYZER TAB - NEW
-    # ------------------------------------------------
+    # IMAGE ANALYZER
 
     with gr.Tab("Image Analyzer"):
 
         gr.Markdown(
-            """
-            ### 📷 Upload an Image
-
-            Upload a photo and ask Alpha AI to analyze it.
-
-            Alpha AI can describe pictures, identify visible
-            objects, read visible text, and answer questions
-            about the image.
-            """
+            "### Upload an image and ask Alpha AI."
         )
 
         image_input = gr.Image(
@@ -775,11 +840,7 @@ with gr.Blocks(
 
         image_question = gr.Textbox(
             label="Ask Alpha AI",
-            placeholder=(
-                "What is in this picture? "
-                "Read the text or explain the image..."
-            ),
-            lines=2
+            placeholder="Describe this image..."
         )
 
         image_analyze_button = gr.Button(
@@ -787,9 +848,7 @@ with gr.Blocks(
             variant="primary"
         )
 
-        image_analysis_output = gr.Markdown(
-            label="Image Analysis"
-        )
+        image_analysis_output = gr.Markdown()
 
         image_analyze_button.click(
             fn=analyze_image,
@@ -800,14 +859,16 @@ with gr.Blocks(
             outputs=image_analysis_output
         )
 
-    # ------------------------------------------------
-    # IMAGE CREATOR TAB
-    # ------------------------------------------------
+    # IMAGE CREATOR
 
     with gr.Tab("Image Creator"):
 
         gr.Markdown(
-            "### Create Images Using Alpha AI"
+            """
+            ### 🎨 Alpha AI Image Creator
+
+            Create images using AI.
+            """
         )
 
         image_prompt = gr.Textbox(
@@ -837,9 +898,7 @@ with gr.Blocks(
             ]
         )
 
-    # ------------------------------------------------
-    # VIDEO ANALYZER TAB
-    # ------------------------------------------------
+    # VIDEO ANALYZER
 
     with gr.Tab("Video Analyzer"):
 
@@ -876,9 +935,7 @@ with gr.Blocks(
             outputs=analysis_output
         )
 
-    # ------------------------------------------------
-    # VIDEO GENERATOR TAB
-    # ------------------------------------------------
+    # VIDEO GENERATOR
 
     with gr.Tab("Video Generator"):
 
@@ -888,10 +945,7 @@ with gr.Blocks(
 
         video_prompt = gr.Textbox(
             label="Video Description",
-            placeholder=(
-                "Saturn rotating in space, "
-                "cinematic camera movement..."
-            ),
+            placeholder="Saturn rotating in space...",
             lines=3
         )
 
@@ -917,12 +971,12 @@ with gr.Blocks(
 
 
 # ==================================================
-# 7. QUEUE CONFIGURATION
+# 7. QUEUE
 # ==================================================
 
 app.queue(
     max_size=10,
-    default_concurrency_limit=1
+    default_concurrency_limit=2
 )
 
 
@@ -937,7 +991,7 @@ if __name__ == "__main__":
     )
 
     logger.info(
-        "STARTING ALPHA AI 3.6 ON PORT %s",
+        "STARTING ALPHA AI 3.7 ON PORT %s",
         PORT
     )
 
@@ -946,4 +1000,4 @@ if __name__ == "__main__":
         server_port=PORT,
         theme=gr.themes.Soft(),
         show_error=False
-        )
+)
