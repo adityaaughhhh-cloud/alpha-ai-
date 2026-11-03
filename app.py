@@ -111,13 +111,14 @@ db_lock = threading.Lock()
 
 
 def get_connection():
-
     connection = sqlite3.connect(
         DB_PATH,
         timeout=30
     )
 
-    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
 
     return connection
 
@@ -142,7 +143,6 @@ def initialize_database():
             connection.commit()
 
         finally:
-
             connection.close()
 
 
@@ -172,7 +172,6 @@ def get_image_usage(session_id):
             return result[0] if result else 0
 
         finally:
-
             connection.close()
 
 
@@ -215,7 +214,6 @@ def consume_image_credit(session_id):
             return cursor.rowcount == 1
 
         finally:
-
             connection.close()
 
 
@@ -230,27 +228,21 @@ def get_error(error):
     message = str(error).lower()
 
     if "429" in message or "quota" in message:
-
         return "API quota reached. Please try again later."
 
     if "503" in message or "overloaded" in message:
-
         return "Alpha AI is experiencing high demand. Please try again shortly."
 
     if "404" in message:
-
         return "The selected AI model is unavailable. Check your model configuration."
 
     if "403" in message:
-
         return "API access denied. Check your Google API permissions."
 
     if "timeout" in message:
-
         return "The request took too long. Please try again."
 
     if "api key" in message:
-
         return "There is a problem with the Gemini API key."
 
     return "Alpha AI could not complete your request. Please try again."
@@ -302,7 +294,6 @@ def prepare_history(history):
 def alpha_chat(message, history):
 
     if not message or not message.strip():
-
         yield "Please enter a message."
         return
 
@@ -373,12 +364,9 @@ def alpha_chat(message, history):
 
         except Exception as error:
 
-            logger.exception(
-                "CHAT ERROR"
-            )
+            logger.exception("CHAT ERROR")
 
             if answer:
-
                 yield answer + "\n\nConnection interrupted."
                 return
 
@@ -401,11 +389,9 @@ def alpha_chat(message, history):
 def analyze_image(image_path, question):
 
     if not image_path:
-
         return "Please upload an image."
 
     if not question or not question.strip():
-
         question = "Describe this image clearly."
 
     start = time.monotonic()
@@ -470,7 +456,6 @@ def analyze_image(image_path, question):
         )
 
     except Exception as error:
-
         return get_error(error)
 
 
@@ -481,7 +466,6 @@ def analyze_image(image_path, question):
 def generate_image(prompt, request: gr.Request):
 
     if not prompt or not prompt.strip():
-
         return None, "Enter an image description."
 
     session_id = (
@@ -493,16 +477,13 @@ def generate_image(prompt, request: gr.Request):
     used = get_image_usage(session_id)
 
     if used >= IMAGE_DAILY_LIMIT:
-
         return None, "Daily image limit reached."
 
     start = time.monotonic()
 
     try:
 
-        logger.info(
-            "IMAGE GENERATION STARTED"
-        )
+        logger.info("IMAGE GENERATION STARTED")
 
         response = client.models.generate_content(
             model=IMAGE_MODEL,
@@ -522,7 +503,6 @@ def generate_image(prompt, request: gr.Request):
                 break
 
         if generated_image is None:
-
             return None, "The image model returned no image."
 
         output = io.BytesIO()
@@ -535,11 +515,9 @@ def generate_image(prompt, request: gr.Request):
         output.seek(0)
 
         with Image.open(output) as check:
-
             check.verify()
 
         if not consume_image_credit(session_id):
-
             return None, "Daily image limit reached."
 
         used = get_image_usage(session_id)
@@ -561,7 +539,6 @@ def generate_image(prompt, request: gr.Request):
         )
 
     except Exception as error:
-
         return None, get_error(error)
 
 
@@ -591,11 +568,9 @@ def get_file_state(video_file):
 def analyze_video(video_path, question):
 
     if not video_path:
-
         return "Please upload a video."
 
     if not question or not question.strip():
-
         question = "Explain what happens in this video."
 
     video_file = None
@@ -604,9 +579,7 @@ def analyze_video(video_path, question):
 
     try:
 
-        logger.info(
-            "VIDEO UPLOAD STARTED"
-        )
+        logger.info("VIDEO UPLOAD STARTED")
 
         video_file = client.files.upload(
             file=video_path
@@ -626,11 +599,9 @@ def analyze_video(video_path, question):
                 break
 
             if state == "FAILED":
-
                 return "Video processing failed."
 
             if time.monotonic() - processing_start > VIDEO_TIMEOUT:
-
                 return "Video processing timed out."
 
             time.sleep(3)
@@ -675,7 +646,6 @@ def analyze_video(video_path, question):
         )
 
     except Exception as error:
-
         return get_error(error)
 
     finally:
@@ -702,7 +672,6 @@ def analyze_video(video_path, question):
 def generate_video(prompt):
 
     if not prompt or not prompt.strip():
-
         return None, "Enter a video description."
 
     output_path = None
@@ -711,9 +680,7 @@ def generate_video(prompt):
 
     try:
 
-        logger.info(
-            "VIDEO GENERATION STARTED"
-        )
+        logger.info("VIDEO GENERATION STARTED")
 
         interaction = client.interactions.create(
             model=VIDEO_MODEL,
@@ -732,7 +699,6 @@ def generate_video(prompt):
         )
 
         if video_output is None:
-
             return None, "The video model returned no video."
 
         video_data = getattr(
@@ -747,9 +713,7 @@ def generate_video(prompt):
             None
         )
 
-        # ---------------------------------------------
         # METHOD 1: BASE64 VIDEO
-        # ---------------------------------------------
 
         if video_data:
 
@@ -766,14 +730,11 @@ def generate_video(prompt):
 
                 output_path = output.name
 
-        # ---------------------------------------------
         # METHOD 2: GOOGLE VIDEO URI
-        # ---------------------------------------------
 
         elif video_uri:
 
             file_name = video_uri.split("/")[-1]
-
             file_name = file_name.split("?")[0]
 
             processing_start = time.monotonic()
@@ -790,11 +751,9 @@ def generate_video(prompt):
                     break
 
                 if state == "FAILED":
-
                     return None, "Video generation failed."
 
                 if time.monotonic() - processing_start > VIDEO_TIMEOUT:
-
                     return None, "Video processing timed out."
 
                 time.sleep(VIDEO_POLL_INTERVAL)
@@ -812,15 +771,12 @@ def generate_video(prompt):
             )
 
         else:
-
             return None, "No video data was returned."
 
         if not output_path or not os.path.exists(output_path):
-
             return None, "The generated video could not be saved."
 
         if os.path.getsize(output_path) == 0:
-
             return None, "The generated video file is empty."
 
         elapsed = time.monotonic() - start
@@ -840,18 +796,14 @@ def generate_video(prompt):
 
     except Exception as error:
 
-        logger.exception(
-            "VIDEO GENERATION ERROR"
-        )
+        logger.exception("VIDEO GENERATION ERROR")
 
         if output_path and os.path.exists(output_path):
 
             try:
-
                 os.remove(output_path)
 
             except OSError:
-
                 pass
 
         return None, get_error(error)
@@ -901,7 +853,7 @@ textarea {
 
 # =====================================================
 # 7. ALPHA INTERFACE
-# GRADIO 6 COMPATIBLE
+# GRADIO 6.31.0 COMPATIBLE
 # =====================================================
 
 with gr.Blocks(
@@ -920,15 +872,12 @@ with gr.Blocks(
 
     with gr.Tabs():
 
-        # =============================================
         # CHAT
-        # =============================================
 
         with gr.Tab("💬 Chat"):
 
             gr.ChatInterface(
                 fn=alpha_chat,
-                type="messages",
                 title="Alpha AI",
                 description="Ask anything. Get fast and intelligent answers.",
                 chatbot=gr.Chatbot(
@@ -945,9 +894,7 @@ with gr.Blocks(
                 undo_btn="Undo"
             )
 
-        # =============================================
         # IMAGE ANALYSIS
-        # =============================================
 
         with gr.Tab("🖼️ Image Analysis"):
 
@@ -981,9 +928,7 @@ with gr.Blocks(
                 outputs=image_analysis_output
             )
 
-        # =============================================
         # IMAGE CREATOR
-        # =============================================
 
         with gr.Tab("🎨 Image Creator"):
 
@@ -1024,9 +969,7 @@ with gr.Blocks(
                 ]
             )
 
-        # =============================================
         # VIDEO ANALYSIS
-        # =============================================
 
         with gr.Tab("🎬 Video Analysis"):
 
@@ -1060,9 +1003,7 @@ with gr.Blocks(
                 outputs=video_analysis_output
             )
 
-        # =============================================
         # VIDEO CREATOR
-        # =============================================
 
         with gr.Tab("🎥 Video Creator"):
 
@@ -1129,9 +1070,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info(
-        "STARTING ALPHA AI 4.0"
-    )
+    logger.info("STARTING ALPHA AI 4.0")
 
     app.launch(
         server_name="0.0.0.0",
@@ -1142,4 +1081,4 @@ if __name__ == "__main__":
         ),
         css=CSS,
         show_error=False
-                )
+    )
