@@ -720,7 +720,7 @@ def generate_video(prompt):
             response_format={
                 "type": "video",
                 "aspect_ratio": "16:9",
-                "resolution": "360p",
+                "resolution": "720p",
                 "delivery": "uri"
             }
         )
@@ -941,7 +941,6 @@ with gr.Blocks(
                 ),
                 chatbot=gr.Chatbot(
                     height=530,
-                    show_copy_button=True,
                     type="messages"
                 ),
                 textbox=gr.Textbox(
