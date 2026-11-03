@@ -17,7 +17,7 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.0
+# ALPHA AI 4.1
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +57,6 @@ VIDEO_MODEL = os.environ.get(
 
 MAX_OUTPUT_TOKENS = 1024
 CHAT_HISTORY_LIMIT = 6
-
 IMAGE_DAILY_LIMIT = 20
 
 VIDEO_TIMEOUT = 600
@@ -111,6 +110,7 @@ db_lock = threading.Lock()
 
 
 def get_connection():
+
     connection = sqlite3.connect(
         DB_PATH,
         timeout=30
@@ -231,13 +231,13 @@ def get_error(error):
         return "API quota reached. Please try again later."
 
     if "503" in message or "overloaded" in message:
-        return "Alpha AI is experiencing high demand. Please try again shortly."
+        return "Alpha AI is experiencing high demand. Try again shortly."
 
     if "404" in message:
-        return "The selected AI model is unavailable. Check your model configuration."
+        return "The selected AI model is unavailable. Check model configuration."
 
     if "403" in message:
-        return "API access denied. Check your Google API permissions."
+        return "API access denied. Check Google API permissions."
 
     if "timeout" in message:
         return "The request took too long. Please try again."
@@ -288,7 +288,7 @@ def prepare_history(history):
 
 
 # =====================================================
-# 1. ALPHA CHAT
+# 1. AI CHAT
 # =====================================================
 
 def alpha_chat(message, history):
@@ -323,10 +323,7 @@ def alpha_chat(message, history):
 
         try:
 
-            logger.info(
-                "CHAT MODEL: %s",
-                model
-            )
+            logger.info("CHAT MODEL: %s", model)
 
             config = types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
@@ -371,11 +368,7 @@ def alpha_chat(message, history):
                 return
 
             if index == 0:
-
-                logger.info(
-                    "Trying backup model."
-                )
-
+                logger.info("Trying backup model.")
                 continue
 
             yield get_error(error)
@@ -402,9 +395,7 @@ def analyze_image(image_path, question):
 
             image = source.convert("RGB")
 
-            image.thumbnail(
-                (1400, 1400)
-            )
+            image.thumbnail((1400, 1400))
 
             buffer = io.BytesIO()
 
@@ -443,10 +434,7 @@ def analyze_image(image_path, question):
             config=config
         )
 
-        answer = (
-            response.text
-            or "No analysis generated."
-        )
+        answer = response.text or "No analysis generated."
 
         elapsed = time.monotonic() - start
 
@@ -474,9 +462,7 @@ def generate_image(prompt, request: gr.Request):
         else "unknown-session"
     )
 
-    used = get_image_usage(session_id)
-
-    if used >= IMAGE_DAILY_LIMIT:
+    if get_image_usage(session_id) >= IMAGE_DAILY_LIMIT:
         return None, "Daily image limit reached."
 
     start = time.monotonic()
@@ -504,18 +490,6 @@ def generate_image(prompt, request: gr.Request):
 
         if generated_image is None:
             return None, "The image model returned no image."
-
-        output = io.BytesIO()
-
-        generated_image.save(
-            output,
-            format="PNG"
-        )
-
-        output.seek(0)
-
-        with Image.open(output) as check:
-            check.verify()
 
         if not consume_image_credit(session_id):
             return None, "Daily image limit reached."
@@ -633,10 +607,7 @@ def analyze_video(video_path, question):
             config=config
         )
 
-        answer = (
-            response.text
-            or "No video analysis generated."
-        )
+        answer = response.text or "No video analysis generated."
 
         elapsed = time.monotonic() - start
 
@@ -660,13 +631,11 @@ def analyze_video(video_path, question):
 
             except Exception:
 
-                logger.warning(
-                    "VIDEO CLEANUP FAILED"
-                )
+                logger.warning("VIDEO CLEANUP FAILED")
 
 
 # =====================================================
-# 5. VIDEO GENERATION - 360P
+# 5. VIDEO GENERATION
 # =====================================================
 
 def generate_video(prompt):
@@ -713,13 +682,9 @@ def generate_video(prompt):
             None
         )
 
-        # METHOD 1: BASE64 VIDEO
-
         if video_data:
 
-            video_bytes = base64.b64decode(
-                video_data
-            )
+            video_bytes = base64.b64decode(video_data)
 
             with tempfile.NamedTemporaryFile(
                 suffix=".mp4",
@@ -727,10 +692,7 @@ def generate_video(prompt):
             ) as output:
 
                 output.write(video_bytes)
-
                 output_path = output.name
-
-        # METHOD 2: GOOGLE VIDEO URI
 
         elif video_uri:
 
@@ -774,10 +736,10 @@ def generate_video(prompt):
             return None, "No video data was returned."
 
         if not output_path or not os.path.exists(output_path):
-            return None, "The generated video could not be saved."
+            return None, "Generated video could not be saved."
 
         if os.path.getsize(output_path) == 0:
-            return None, "The generated video file is empty."
+            return None, "Generated video file is empty."
 
         elapsed = time.monotonic() - start
 
@@ -852,8 +814,8 @@ textarea {
 
 
 # =====================================================
-# 7. ALPHA INTERFACE
-# GRADIO 6.31.0 COMPATIBLE
+# 7. USER INTERFACE
+# GRADIO 6.31.0
 # =====================================================
 
 with gr.Blocks(
@@ -886,21 +848,17 @@ with gr.Blocks(
                 textbox=gr.Textbox(
                     placeholder="Message Alpha AI...",
                     container=True,
-                    scale=7
-                ),
-                submit_btn="Send",
-                stop_btn="Stop",
-                retry_btn="Regenerate",
-                undo_btn="Undo"
+                    scale=7,
+                    submit_btn="Send",
+                    stop_btn="Stop"
+                )
             )
 
         # IMAGE ANALYSIS
 
         with gr.Tab("🖼️ Image Analysis"):
 
-            gr.Markdown(
-                "## Understand any image"
-            )
+            gr.Markdown("## Understand any image")
 
             image_input = gr.Image(
                 label="Upload Image",
@@ -973,9 +931,7 @@ with gr.Blocks(
 
         with gr.Tab("🎬 Video Analysis"):
 
-            gr.Markdown(
-                "## Understand Videos"
-            )
+            gr.Markdown("## Understand Videos")
 
             video_input = gr.Video(
                 label="Upload Video",
@@ -1070,7 +1026,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info("STARTING ALPHA AI 4.0")
+    logger.info("STARTING ALPHA AI 4.1")
 
     app.launch(
         server_name="0.0.0.0",
@@ -1080,5 +1036,5 @@ if __name__ == "__main__":
             secondary_hue="slate"
         ),
         css=CSS,
-        show_error=False
-    )
+        show_error=True
+        )
