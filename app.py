@@ -6,6 +6,7 @@ import tempfile
 import logging
 import sqlite3
 import threading
+import re
 
 from datetime import date
 
@@ -17,7 +18,7 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.1
+# ALPHA AI 4.2 - SPEED OPTIMIZED
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -31,9 +32,7 @@ logger = logging.getLogger("ALPHA")
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is missing from Render environment variables."
-    )
+    raise RuntimeError("GEMINI_API_KEY is missing.")
 
 CHAT_MODEL = os.environ.get(
     "CHAT_MODEL",
@@ -55,8 +54,12 @@ VIDEO_MODEL = os.environ.get(
     "gemini-omni-1.1-flash"
 )
 
-MAX_OUTPUT_TOKENS = 400
-CHAT_HISTORY_LIMIT = 3
+SIMPLE_TOKENS = 128
+NORMAL_TOKENS = 256
+MAX_OUTPUT_TOKENS = 512
+
+CHAT_HISTORY_LIMIT = 5
+
 IMAGE_DAILY_LIMIT = 15
 
 VIDEO_TIMEOUT = 100
@@ -79,27 +82,74 @@ client = genai.Client(api_key=API_KEY)
 SYSTEM_INSTRUCTION = """
 You are Alpha AI, an intelligent AI assistant.
 
-Identity:
 Name: Alpha AI
 Tagline: Think Beyond Limits.
 
-Rules:
+RULES:
 
-1. Give accurate and useful answers.
-2. Never invent facts.
-3. Answer the actual question.
-4. Keep simple answers short.
-5. Explain complicated topics clearly.
+1. Answer the actual question.
+2. Be accurate and useful.
+3. Never invent facts.
+4. Keep simple answers very short.
+5. Explain complicated questions clearly.
 6. Use simple English.
-7. Use mathematical reasoning when required.
-8. Admit uncertainty when necessary.
-9. Avoid unnecessary introductions.
-10. Be professional and helpful.
-11. Use conversation history when relevant.
-12. Do not repeat information unnecessarily.
+7. Avoid unnecessary introductions.
+8. Do not repeat information.
+9. Use conversation history when relevant.
+10. Admit uncertainty when necessary.
 
-Your goal is to provide fast, useful and reliable answers.
+Prioritize fast, accurate and helpful answers.
 """
+
+
+# =====================================================
+# CHAT SPEED OPTIMIZATION
+# =====================================================
+
+def choose_token_limit(message):
+
+    text = message.strip()
+
+    if len(text) <= 90 and len(text.split()) <= 14:
+        return SIMPLE_TOKENS
+
+    if len(text) <= 250 and len(text.split()) <= 40:
+        return NORMAL_TOKENS
+
+    return MAX_OUTPUT_TOKENS
+
+
+def prepare_history(history):
+
+    contents = []
+
+    for item in (history or [])[-CHAT_HISTORY_LIMIT:]:
+
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role")
+        content = item.get("content")
+
+        if role not in ["user", "assistant"]:
+            continue
+
+        if not isinstance(content, str):
+            continue
+
+        if not content.strip():
+            continue
+
+        contents.append(
+            types.Content(
+                role="user" if role == "user" else "model",
+                parts=[
+                    types.Part.from_text(text=content)
+                ]
+            )
+        )
+
+    return contents
 
 
 # =====================================================
@@ -234,7 +284,7 @@ def get_error(error):
         return "Alpha AI is experiencing high demand. Try again shortly."
 
     if "404" in message:
-        return "The selected AI model is unavailable. Check model configuration."
+        return "The selected AI model is unavailable."
 
     if "403" in message:
         return "API access denied. Check Google API permissions."
@@ -249,45 +299,6 @@ def get_error(error):
 
 
 # =====================================================
-# CHAT HISTORY
-# =====================================================
-
-def prepare_history(history):
-
-    contents = []
-
-    for item in (history or [])[-CHAT_HISTORY_LIMIT:]:
-
-        if not isinstance(item, dict):
-            continue
-
-        role = item.get("role")
-        content = item.get("content")
-
-        if role not in ["user", "assistant"]:
-            continue
-
-        if not isinstance(content, str):
-            continue
-
-        if not content.strip():
-            continue
-
-        contents.append(
-            types.Content(
-                role="user" if role == "user" else "model",
-                parts=[
-                    types.Part.from_text(
-                        text=content
-                    )
-                ]
-            )
-        )
-
-    return contents
-
-
-# =====================================================
 # 1. AI CHAT
 # =====================================================
 
@@ -299,17 +310,25 @@ def alpha_chat(message, history):
 
     start = time.monotonic()
 
+    message = message.strip()
+
     contents = prepare_history(history)
 
     contents.append(
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(
-                    text=message.strip()
-                )
+                types.Part.from_text(text=message)
             ]
         )
+    )
+
+    token_limit = choose_token_limit(message)
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.3,
+        max_output_tokens=token_limit
     )
 
     models = [
@@ -323,12 +342,10 @@ def alpha_chat(message, history):
 
         try:
 
-            logger.info("CHAT MODEL: %s", model)
-
-            config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.3,
-                max_output_tokens=MAX_OUTPUT_TOKENS
+            logger.info(
+                "CHAT START: model=%s tokens=%s",
+                model,
+                token_limit
             )
 
             stream = client.models.generate_content_stream(
@@ -350,7 +367,7 @@ def alpha_chat(message, history):
                 elapsed = time.monotonic() - start
 
                 logger.info(
-                    "CHAT COMPLETED: %.2f seconds",
+                    "CHAT COMPLETE: %.2f seconds",
                     elapsed
                 )
 
@@ -361,14 +378,21 @@ def alpha_chat(message, history):
 
         except Exception as error:
 
-            logger.exception("CHAT ERROR")
+            logger.exception(
+                "CHAT ERROR: %s",
+                model
+            )
 
             if answer:
                 yield answer + "\n\nConnection interrupted."
                 return
 
             if index == 0:
-                logger.info("Trying backup model.")
+
+                logger.info(
+                    "Trying backup model."
+                )
+
                 continue
 
             yield get_error(error)
@@ -395,14 +419,14 @@ def analyze_image(image_path, question):
 
             image = source.convert("RGB")
 
-            image.thumbnail((1400, 1400))
+            image.thumbnail((1200, 1200))
 
             buffer = io.BytesIO()
 
             image.save(
                 buffer,
                 format="JPEG",
-                quality=82
+                quality=80
             )
 
             image_bytes = buffer.getvalue()
@@ -444,6 +468,7 @@ def analyze_image(image_path, question):
         )
 
     except Exception as error:
+
         return get_error(error)
 
 
@@ -499,7 +524,7 @@ def generate_image(prompt, request: gr.Request):
         elapsed = time.monotonic() - start
 
         logger.info(
-            "IMAGE GENERATED IN %.2f SECONDS",
+            "IMAGE GENERATED: %.2f seconds",
             elapsed
         )
 
@@ -513,6 +538,7 @@ def generate_image(prompt, request: gr.Request):
         )
 
     except Exception as error:
+
         return None, get_error(error)
 
 
@@ -617,6 +643,7 @@ def analyze_video(video_path, question):
         )
 
     except Exception as error:
+
         return get_error(error)
 
     finally:
@@ -744,7 +771,7 @@ def generate_video(prompt):
         elapsed = time.monotonic() - start
 
         logger.info(
-            "VIDEO GENERATED IN %.2f SECONDS",
+            "VIDEO GENERATED: %.2f seconds",
             elapsed
         )
 
@@ -764,7 +791,6 @@ def generate_video(prompt):
 
             try:
                 os.remove(output_path)
-
             except OSError:
                 pass
 
@@ -815,7 +841,6 @@ textarea {
 
 # =====================================================
 # 7. USER INTERFACE
-# GRADIO 6.31.0
 # =====================================================
 
 with gr.Blocks(
@@ -896,7 +921,7 @@ with gr.Blocks(
 
                 Create images using artificial intelligence.
 
-                Free daily allowance: 20 images per session.
+                Free daily allowance: 15 images per session.
                 """
             )
 
@@ -1026,7 +1051,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info("STARTING ALPHA AI 4.1")
+    logger.info("STARTING ALPHA AI 4.2")
 
     app.launch(
         server_name="0.0.0.0",
@@ -1037,4 +1062,4 @@ if __name__ == "__main__":
         ),
         css=CSS,
         show_error=True
-        )
+            )
