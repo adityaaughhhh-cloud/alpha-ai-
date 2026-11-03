@@ -18,7 +18,7 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.2 - SPEED OPTIMIZED
+# ALPHA AI 4.3 - SMART TOKEN OPTIMIZATION
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -54,9 +54,14 @@ VIDEO_MODEL = os.environ.get(
     "gemini-omni-1.1-flash"
 )
 
-SIMPLE_TOKENS = 128
-NORMAL_TOKENS = 256
-MAX_OUTPUT_TOKENS = 512
+
+# SMART TOKEN SETTINGS
+
+SIMPLE_TOKENS = 256
+NORMAL_TOKENS = 1024
+ADVANCED_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 4096
+
 
 CHAT_HISTORY_LIMIT = 5
 
@@ -90,7 +95,7 @@ RULES:
 1. Answer the actual question.
 2. Be accurate and useful.
 3. Never invent facts.
-4. Keep simple answers very short.
+4. Keep simple answers short.
 5. Explain complicated questions clearly.
 6. Use simple English.
 7. Avoid unnecessary introductions.
@@ -98,26 +103,77 @@ RULES:
 9. Use conversation history when relevant.
 10. Admit uncertainty when necessary.
 
-Prioritize fast, accurate and helpful answers.
+DETAILED ANSWER RULES:
+
+11. When the user asks for a derivation,
+    provide the mathematical steps.
+
+12. When equations are needed,
+    explain what each important symbol means.
+
+13. Do not skip important calculation steps.
+
+14. For step-by-step questions,
+    organize the answer into numbered steps.
+
+15. When the user asks for a detailed explanation,
+    provide enough information to answer completely.
+
+16. Do not deliberately shorten an answer
+    when the user requests a full explanation.
+
+Prioritize accuracy, clarity and useful answers.
 """
 
 
 # =====================================================
-# CHAT SPEED OPTIMIZATION
+# SMART TOKEN SELECTION
 # =====================================================
 
 def choose_token_limit(message):
 
-    text = message.strip()
+    text = message.strip().lower()
 
-    if len(text) <= 90 and len(text.split()) <= 14:
+    detailed_terms = [
+        "derive",
+        "derivation",
+        "mathematically",
+        "mathematical proof",
+        "prove",
+        "step by step",
+        "step-by-step",
+        "in detail",
+        "detailed explanation",
+        "full explanation",
+        "show all steps",
+        "with equations",
+        "with examples",
+        "comprehensive",
+        "explain fully",
+        "calculate step by step"
+    ]
+
+    # Detailed questions and derivations
+    if any(term in text for term in detailed_terms):
+        return ADVANCED_TOKENS
+
+    word_count = len(text.split())
+
+    # Short questions
+    if word_count <= 14 and len(text) <= 100:
         return SIMPLE_TOKENS
 
-    if len(text) <= 250 and len(text.split()) <= 40:
+    # Normal questions
+    if word_count <= 40 and len(text) <= 250:
         return NORMAL_TOKENS
 
+    # Longer questions
     return MAX_OUTPUT_TOKENS
 
+
+# =====================================================
+# CHAT HISTORY
+# =====================================================
 
 def prepare_history(history):
 
@@ -1051,7 +1107,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info("STARTING ALPHA AI 4.2")
+    logger.info("STARTING ALPHA AI 4.3")
 
     app.launch(
         server_name="0.0.0.0",
@@ -1062,4 +1118,4 @@ if __name__ == "__main__":
         ),
         css=CSS,
         show_error=True
-            )
+    )
