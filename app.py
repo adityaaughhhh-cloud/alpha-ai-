@@ -1,18 +1,12 @@
 import os
 import io
 import time
-import base64
-import tempfile
 import logging
-import sqlite3
 import threading
-import re
-import subprocess
 
 from datetime import date
 
 import gradio as gr
-import imageio_ffmpeg
 
 from PIL import Image
 from google import genai
@@ -20,7 +14,7 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.4 - FFMPEG + 720P
+# ALPHA AI 4.5 - CHAT + IMAGE ANALYSIS + VIDEO ANALYSIS
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +30,7 @@ API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing.")
 
+
 CHAT_MODEL = os.environ.get(
     "CHAT_MODEL",
     "gemini-3.5-flash-lite"
@@ -46,126 +41,24 @@ BACKUP_MODEL = os.environ.get(
     "gemini-3.1-flash-lite"
 )
 
-IMAGE_MODEL = os.environ.get(
-    "IMAGE_MODEL",
-    "gemini-3.1-flash-image"
-)
 
-VIDEO_MODEL = os.environ.get(
-    "VIDEO_MODEL",
-    "gemini-omni-1.1-flash"
-)
-
-
-# SMART TOKEN SETTINGS
+CHAT_HISTORY_LIMIT = 5
 
 SIMPLE_TOKENS = 256
 NORMAL_TOKENS = 1024
 ADVANCED_TOKENS = 4096
 MAX_OUTPUT_TOKENS = 4096
 
-CHAT_HISTORY_LIMIT = 5
-
-IMAGE_DAILY_LIMIT = 15
-
 VIDEO_TIMEOUT = 100
-VIDEO_POLL_INTERVAL = 5
 
-VIDEO_RESOLUTION = "720p"
-VIDEO_WIDTH = 1280
-VIDEO_HEIGHT = 720
-VIDEO_FPS = 24
-
-DB_PATH = os.environ.get(
-    "DB_PATH",
-    "alpha_usage.db"
+PORT = int(
+    os.environ.get("PORT", "10000")
 )
 
-PORT = int(os.environ.get("PORT", "10000"))
 
-client = genai.Client(api_key=API_KEY)
-
-
-# =====================================================
-# FFMPEG CONFIGURATION
-# =====================================================
-
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-
-logger.info("FFMPEG READY: %s", FFMPEG_PATH)
-
-
-def convert_video_720p(input_path):
-
-    output_path = tempfile.NamedTemporaryFile(
-        suffix="_720p.mp4",
-        delete=False
-    ).name
-
-    command = [
-        FFMPEG_PATH,
-        "-y",
-        "-i", input_path,
-        "-vf",
-        (
-            "scale=1280:720:"
-            "force_original_aspect_ratio=decrease,"
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-            "setsar=1"
-        ),
-        "-r", "24",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path
-    ]
-
-    try:
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-
-        if result.returncode != 0:
-
-            logger.error(
-                "FFMPEG ERROR: %s",
-                result.stderr[-3000:]
-            )
-
-            raise RuntimeError(
-                "FFmpeg conversion failed."
-            )
-
-        if not os.path.exists(output_path):
-            raise RuntimeError(
-                "FFmpeg output was not created."
-            )
-
-        if os.path.getsize(output_path) == 0:
-            raise RuntimeError(
-                "FFmpeg generated an empty video."
-            )
-
-        return output_path
-
-    except Exception:
-
-        if os.path.exists(output_path):
-
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-
-        raise
+client = genai.Client(
+    api_key=API_KEY
+)
 
 
 # =====================================================
@@ -241,7 +134,10 @@ def choose_token_limit(message):
         "calculate step by step"
     ]
 
-    if any(term in text for term in detailed_terms):
+    if any(
+        term in text
+        for term in detailed_terms
+    ):
         return ADVANCED_TOKENS
 
     word_count = len(text.split())
@@ -284,7 +180,9 @@ def prepare_history(history):
             types.Content(
                 role="user" if role == "user" else "model",
                 parts=[
-                    types.Part.from_text(text=content)
+                    types.Part.from_text(
+                        text=content
+                    )
                 ]
             )
         )
@@ -293,149 +191,56 @@ def prepare_history(history):
 
 
 # =====================================================
-# DATABASE
-# =====================================================
-
-db_lock = threading.Lock()
-
-
-def get_connection():
-
-    connection = sqlite3.connect(
-        DB_PATH,
-        timeout=30
-    )
-
-    connection.execute(
-        "PRAGMA busy_timeout = 30000"
-    )
-
-    return connection
-
-
-def initialize_database():
-
-    with db_lock:
-
-        connection = get_connection()
-
-        try:
-
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS image_usage (
-                    session_id TEXT NOT NULL,
-                    usage_date TEXT NOT NULL,
-                    image_count INTEGER DEFAULT 0,
-                    PRIMARY KEY (session_id, usage_date)
-                )
-            """)
-
-            connection.commit()
-
-        finally:
-            connection.close()
-
-
-initialize_database()
-
-
-def get_image_usage(session_id):
-
-    today = date.today().isoformat()
-
-    with db_lock:
-
-        connection = get_connection()
-
-        try:
-
-            result = connection.execute(
-                """
-                SELECT image_count
-                FROM image_usage
-                WHERE session_id = ?
-                AND usage_date = ?
-                """,
-                (session_id, today)
-            ).fetchone()
-
-            return result[0] if result else 0
-
-        finally:
-            connection.close()
-
-
-def consume_image_credit(session_id):
-
-    today = date.today().isoformat()
-
-    with db_lock:
-
-        connection = get_connection()
-
-        try:
-
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO image_usage
-                (session_id, usage_date, image_count)
-                VALUES (?, ?, 0)
-                """,
-                (session_id, today)
-            )
-
-            cursor = connection.execute(
-                """
-                UPDATE image_usage
-                SET image_count = image_count + 1
-                WHERE session_id = ?
-                AND usage_date = ?
-                AND image_count < ?
-                """,
-                (
-                    session_id,
-                    today,
-                    IMAGE_DAILY_LIMIT
-                )
-            )
-
-            connection.commit()
-
-            return cursor.rowcount == 1
-
-        finally:
-            connection.close()
-
-
-# =====================================================
 # ERROR HANDLING
 # =====================================================
 
 def get_error(error):
 
-    logger.exception("ALPHA ERROR")
+    logger.exception(
+        "ALPHA ERROR"
+    )
 
     message = str(error).lower()
 
     if "429" in message or "quota" in message:
-        return "API quota reached. Please try again later."
+        return (
+            "API quota reached. "
+            "Please try again later."
+        )
 
     if "503" in message or "overloaded" in message:
-        return "Alpha AI is experiencing high demand. Try again shortly."
+        return (
+            "Alpha AI is experiencing high demand. "
+            "Try again shortly."
+        )
 
     if "404" in message:
-        return "The selected AI model is unavailable."
+        return (
+            "The selected AI model is unavailable. "
+            "Check the model configuration."
+        )
 
     if "403" in message:
-        return "API access denied. Check Google API permissions."
+        return (
+            "API access denied. "
+            "Check Google API permissions."
+        )
 
     if "timeout" in message:
-        return "The request took too long. Please try again."
+        return (
+            "The request took too long. "
+            "Please try again."
+        )
 
     if "api key" in message:
-        return "There is a problem with the Gemini API key."
+        return (
+            "There is a problem with the Gemini API key."
+        )
 
-    return "Alpha AI could not complete your request. Please try again."
+    return (
+        "Alpha AI could not complete your request. "
+        "Please try again."
+    )
 
 
 # =====================================================
@@ -445,6 +250,7 @@ def get_error(error):
 def alpha_chat(message, history):
 
     if not message or not message.strip():
+
         yield "Please enter a message."
         return
 
@@ -458,12 +264,16 @@ def alpha_chat(message, history):
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(text=message)
+                types.Part.from_text(
+                    text=message
+                )
             ]
         )
     )
 
-    token_limit = choose_token_limit(message)
+    token_limit = choose_token_limit(
+        message
+    )
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
@@ -504,7 +314,9 @@ def alpha_chat(message, history):
 
             if answer:
 
-                elapsed = time.monotonic() - start
+                elapsed = (
+                    time.monotonic() - start
+                )
 
                 logger.info(
                     "CHAT COMPLETE: %.2f seconds",
@@ -524,12 +336,19 @@ def alpha_chat(message, history):
             )
 
             if answer:
-                yield answer + "\n\nConnection interrupted."
+
+                yield (
+                    answer
+                    + "\n\nConnection interrupted."
+                )
+
                 return
 
             if index == 0:
 
-                logger.info("Trying backup model.")
+                logger.info(
+                    "Trying backup model."
+                )
 
                 continue
 
@@ -547,17 +366,26 @@ def analyze_image(image_path, question):
         return "Please upload an image."
 
     if not question or not question.strip():
-        question = "Describe this image clearly."
+
+        question = (
+            "Describe this image clearly."
+        )
 
     start = time.monotonic()
 
     try:
 
+        logger.info(
+            "IMAGE ANALYSIS STARTED"
+        )
+
         with Image.open(image_path) as source:
 
             image = source.convert("RGB")
 
-            image.thumbnail((1200, 1200))
+            image.thumbnail(
+                (1200, 1200)
+            )
 
             buffer = io.BytesIO()
 
@@ -596,9 +424,19 @@ def analyze_image(image_path, question):
             config=config
         )
 
-        answer = response.text or "No analysis generated."
+        answer = (
+            response.text
+            or "No analysis generated."
+        )
 
-        elapsed = time.monotonic() - start
+        elapsed = (
+            time.monotonic() - start
+        )
+
+        logger.info(
+            "IMAGE ANALYSIS COMPLETE: %.2f seconds",
+            elapsed
+        )
 
         return (
             answer
@@ -608,76 +446,6 @@ def analyze_image(image_path, question):
     except Exception as error:
 
         return get_error(error)
-
-
-# =====================================================
-# 3. IMAGE GENERATION
-# =====================================================
-
-def generate_image(prompt, request: gr.Request):
-
-    if not prompt or not prompt.strip():
-        return None, "Enter an image description."
-
-    session_id = (
-        request.session_hash
-        if request
-        else "unknown-session"
-    )
-
-    if get_image_usage(session_id) >= IMAGE_DAILY_LIMIT:
-        return None, "Daily image limit reached."
-
-    start = time.monotonic()
-
-    try:
-
-        logger.info("IMAGE GENERATION STARTED")
-
-        response = client.models.generate_content(
-            model=IMAGE_MODEL,
-            contents=prompt.strip(),
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"]
-            )
-        )
-
-        generated_image = None
-
-        for part in (response.parts or []):
-
-            if getattr(part, "inline_data", None):
-
-                generated_image = part.as_image()
-                break
-
-        if generated_image is None:
-            return None, "The image model returned no image."
-
-        if not consume_image_credit(session_id):
-            return None, "Daily image limit reached."
-
-        used = get_image_usage(session_id)
-
-        elapsed = time.monotonic() - start
-
-        logger.info(
-            "IMAGE GENERATED: %.2f seconds",
-            elapsed
-        )
-
-        return (
-            generated_image,
-            (
-                "Image generated successfully!\n\n"
-                f"Time: {elapsed:.2f} seconds.\n"
-                f"Daily usage: {used}/{IMAGE_DAILY_LIMIT}"
-            )
-        )
-
-    except Exception as error:
-
-        return None, get_error(error)
 
 
 # =====================================================
@@ -700,7 +468,7 @@ def get_file_state(video_file):
 
 
 # =====================================================
-# 4. VIDEO ANALYSIS
+# 3. VIDEO ANALYSIS
 # =====================================================
 
 def analyze_video(video_path, question):
@@ -709,7 +477,10 @@ def analyze_video(video_path, question):
         return "Please upload a video."
 
     if not question or not question.strip():
-        question = "Explain what happens in this video."
+
+        question = (
+            "Explain what happens in this video."
+        )
 
     video_file = None
 
@@ -717,7 +488,9 @@ def analyze_video(video_path, question):
 
     try:
 
-        logger.info("VIDEO UPLOAD STARTED")
+        logger.info(
+            "VIDEO UPLOAD STARTED"
+        )
 
         video_file = client.files.upload(
             file=video_path
@@ -731,16 +504,27 @@ def analyze_video(video_path, question):
                 name=video_file.name
             )
 
-            state = get_file_state(video_file)
+            state = get_file_state(
+                video_file
+            )
 
             if state == "ACTIVE":
                 break
 
             if state == "FAILED":
-                return "Video processing failed."
 
-            if time.monotonic() - processing_start > VIDEO_TIMEOUT:
-                return "Video processing timed out."
+                return (
+                    "Video processing failed."
+                )
+
+            if (
+                time.monotonic() - processing_start
+                > VIDEO_TIMEOUT
+            ):
+
+                return (
+                    "Video processing timed out."
+                )
 
             time.sleep(3)
 
@@ -771,9 +555,19 @@ def analyze_video(video_path, question):
             config=config
         )
 
-        answer = response.text or "No video analysis generated."
+        answer = (
+            response.text
+            or "No video analysis generated."
+        )
 
-        elapsed = time.monotonic() - start
+        elapsed = (
+            time.monotonic() - start
+        )
+
+        logger.info(
+            "VIDEO ANALYSIS COMPLETE: %.2f seconds",
+            elapsed
+        )
 
         return (
             answer
@@ -796,175 +590,13 @@ def analyze_video(video_path, question):
 
             except Exception:
 
-                logger.warning("VIDEO CLEANUP FAILED")
-
-
-# =====================================================
-# 5. VIDEO GENERATION - 720P + FFMPEG
-# =====================================================
-
-def generate_video(prompt):
-
-    if not prompt or not prompt.strip():
-        return None, "Enter a video description."
-
-    output_path = None
-
-    start = time.monotonic()
-
-    try:
-
-        logger.info(
-            "720P VIDEO GENERATION STARTED"
-        )
-
-        interaction = client.interactions.create(
-            model=VIDEO_MODEL,
-            input=prompt.strip(),
-            response_format={
-                "type": "video",
-                "aspect_ratio": "16:9",
-                "resolution": VIDEO_RESOLUTION
-            }
-        )
-
-        video_output = getattr(
-            interaction,
-            "output_video",
-            None
-        )
-
-        if video_output is None:
-            return None, "The video model returned no video."
-
-        video_data = getattr(
-            video_output,
-            "data",
-            None
-        )
-
-        video_uri = getattr(
-            video_output,
-            "uri",
-            None
-        )
-
-        if video_data:
-
-            video_bytes = base64.b64decode(video_data)
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp4",
-                delete=False
-            ) as output:
-
-                output.write(video_bytes)
-                output_path = output.name
-
-        elif video_uri:
-
-            file_name = video_uri.split("/")[-1]
-            file_name = file_name.split("?")[0]
-
-            processing_start = time.monotonic()
-
-            while True:
-
-                video_file = client.files.get(
-                    name=f"files/{file_name}"
+                logger.warning(
+                    "VIDEO CLEANUP FAILED"
                 )
 
-                state = get_file_state(video_file)
-
-                if state == "ACTIVE":
-                    break
-
-                if state == "FAILED":
-                    return None, "Video generation failed."
-
-                if time.monotonic() - processing_start > VIDEO_TIMEOUT:
-                    return None, "Video processing timed out."
-
-                time.sleep(VIDEO_POLL_INTERVAL)
-
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp4",
-                delete=False
-            ) as output:
-
-                output_path = output.name
-
-            client.files.download(
-                file=video_uri,
-                destination=output_path
-            )
-
-        else:
-            return None, "No video data was returned."
-
-        if not output_path or not os.path.exists(output_path):
-            return None, "Generated video could not be saved."
-
-        if os.path.getsize(output_path) == 0:
-            return None, "Generated video file is empty."
-
-        # FFMPEG 720P CONVERSION
-
-        logger.info("STARTING FFMPEG 720P PROCESSING")
-
-        original_path = output_path
-
-        try:
-
-            output_path = convert_video_720p(
-                original_path
-            )
-
-            try:
-                os.remove(original_path)
-            except OSError:
-                pass
-
-        except Exception:
-
-            logger.exception("FFMPEG FAILED")
-
-            return None, "Video was generated, but FFmpeg processing failed."
-
-        elapsed = time.monotonic() - start
-
-        logger.info(
-            "720P VIDEO COMPLETE: %.2f seconds",
-            elapsed
-        )
-
-        return (
-            output_path,
-            (
-                "720p video generated successfully!\n\n"
-                "Resolution: 1280 × 720\n"
-                "Frame rate: 24 FPS\n"
-                "Format: MP4\n"
-                f"Total time: {elapsed:.2f} seconds."
-            )
-        )
-
-    except Exception as error:
-
-        logger.exception("VIDEO GENERATION ERROR")
-
-        if output_path and os.path.exists(output_path):
-
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-
-        return None, get_error(error)
-
 
 # =====================================================
-# 6. DESIGN
+# 4. DESIGN
 # =====================================================
 
 CSS = """
@@ -1006,7 +638,7 @@ textarea {
 
 
 # =====================================================
-# 7. USER INTERFACE
+# 5. USER INTERFACE
 # =====================================================
 
 with gr.Blocks(
@@ -1032,7 +664,10 @@ with gr.Blocks(
             gr.ChatInterface(
                 fn=alpha_chat,
                 title="Alpha AI",
-                description="Ask anything. Get fast and intelligent answers.",
+                description=(
+                    "Ask anything. "
+                    "Get fast and intelligent answers."
+                ),
                 chatbot=gr.Chatbot(
                     height=530
                 ),
@@ -1049,7 +684,9 @@ with gr.Blocks(
 
         with gr.Tab("🖼️ Image Analysis"):
 
-            gr.Markdown("## Understand any image")
+            gr.Markdown(
+                "## Understand any image"
+            )
 
             image_input = gr.Image(
                 label="Upload Image",
@@ -1077,52 +714,13 @@ with gr.Blocks(
                 outputs=image_analysis_output
             )
 
-        # IMAGE CREATOR
-
-        with gr.Tab("🎨 Image Creator"):
-
-            gr.Markdown(
-                """
-                ## Alpha AI Image Creator
-
-                Create images using artificial intelligence.
-
-                Free daily allowance: 15 images per session.
-                """
-            )
-
-            image_prompt = gr.Textbox(
-                label="Describe your image",
-                placeholder="A futuristic city on Mars with flying vehicles...",
-                lines=3
-            )
-
-            image_button = gr.Button(
-                "Generate Image",
-                variant="primary"
-            )
-
-            generated_image = gr.Image(
-                label="Your Generated Image",
-                type="pil"
-            )
-
-            image_status = gr.Markdown()
-
-            image_button.click(
-                fn=generate_image,
-                inputs=image_prompt,
-                outputs=[
-                    generated_image,
-                    image_status
-                ]
-            )
-
         # VIDEO ANALYSIS
 
         with gr.Tab("🎬 Video Analysis"):
 
-            gr.Markdown("## Understand Videos")
+            gr.Markdown(
+                "## Understand Videos"
+            )
 
             video_input = gr.Video(
                 label="Upload Video",
@@ -1131,7 +729,9 @@ with gr.Blocks(
 
             video_question = gr.Textbox(
                 label="Ask Alpha",
-                placeholder="Explain what happens in this video."
+                placeholder=(
+                    "Explain what happens in this video."
+                )
             )
 
             video_analyze_button = gr.Button(
@@ -1150,50 +750,6 @@ with gr.Blocks(
                 outputs=video_analysis_output
             )
 
-        # VIDEO CREATOR
-
-        with gr.Tab("🎥 Video Creator"):
-
-            gr.Markdown(
-                """
-                ## Alpha AI Video Creator
-
-                Generate videos from text descriptions.
-
-                Resolution: 720p (1280 × 720)
-
-                Frame rate: 24 FPS
-
-                Format: MP4
-                """
-            )
-
-            video_prompt = gr.Textbox(
-                label="Describe your video",
-                placeholder="A cinematic view of Saturn rotating in deep space...",
-                lines=3
-            )
-
-            video_generate_button = gr.Button(
-                "Generate Video",
-                variant="primary"
-            )
-
-            generated_video = gr.Video(
-                label="Generated Video"
-            )
-
-            video_status = gr.Markdown()
-
-            video_generate_button.click(
-                fn=generate_video,
-                inputs=video_prompt,
-                outputs=[
-                    generated_video,
-                    video_status
-                ]
-            )
-
     gr.Markdown(
         """
         ---
@@ -1206,7 +762,7 @@ with gr.Blocks(
 
 
 # =====================================================
-# 8. PERFORMANCE QUEUE
+# 6. PERFORMANCE QUEUE
 # =====================================================
 
 app.queue(
@@ -1216,12 +772,14 @@ app.queue(
 
 
 # =====================================================
-# 9. START SERVER
+# 7. START SERVER
 # =====================================================
 
 if __name__ == "__main__":
 
-    logger.info("STARTING ALPHA AI 4.4")
+    logger.info(
+        "STARTING ALPHA AI 4.5"
+    )
 
     app.launch(
         server_name="0.0.0.0",
@@ -1232,4 +790,4 @@ if __name__ == "__main__":
         ),
         css=CSS,
         show_error=True
-        )
+                )
