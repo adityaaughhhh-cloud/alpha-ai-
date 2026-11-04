@@ -7,10 +7,12 @@ import logging
 import sqlite3
 import threading
 import re
+import subprocess
 
 from datetime import date
 
 import gradio as gr
+import imageio_ffmpeg
 
 from PIL import Image
 from google import genai
@@ -18,7 +20,7 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.3 - SMART TOKEN OPTIMIZATION
+# ALPHA AI 4.4 - FFMPEG + 720P
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -62,13 +64,17 @@ NORMAL_TOKENS = 1024
 ADVANCED_TOKENS = 4096
 MAX_OUTPUT_TOKENS = 4096
 
-
 CHAT_HISTORY_LIMIT = 5
 
 IMAGE_DAILY_LIMIT = 15
 
 VIDEO_TIMEOUT = 100
 VIDEO_POLL_INTERVAL = 5
+
+VIDEO_RESOLUTION = "720p"
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+VIDEO_FPS = 24
 
 DB_PATH = os.environ.get(
     "DB_PATH",
@@ -78,6 +84,88 @@ DB_PATH = os.environ.get(
 PORT = int(os.environ.get("PORT", "10000"))
 
 client = genai.Client(api_key=API_KEY)
+
+
+# =====================================================
+# FFMPEG CONFIGURATION
+# =====================================================
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+logger.info("FFMPEG READY: %s", FFMPEG_PATH)
+
+
+def convert_video_720p(input_path):
+
+    output_path = tempfile.NamedTemporaryFile(
+        suffix="_720p.mp4",
+        delete=False
+    ).name
+
+    command = [
+        FFMPEG_PATH,
+        "-y",
+        "-i", input_path,
+        "-vf",
+        (
+            "scale=1280:720:"
+            "force_original_aspect_ratio=decrease,"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
+            "setsar=1"
+        ),
+        "-r", "24",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+
+    try:
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+
+            logger.error(
+                "FFMPEG ERROR: %s",
+                result.stderr[-3000:]
+            )
+
+            raise RuntimeError(
+                "FFmpeg conversion failed."
+            )
+
+        if not os.path.exists(output_path):
+            raise RuntimeError(
+                "FFmpeg output was not created."
+            )
+
+        if os.path.getsize(output_path) == 0:
+            raise RuntimeError(
+                "FFmpeg generated an empty video."
+            )
+
+        return output_path
+
+    except Exception:
+
+        if os.path.exists(output_path):
+
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+        raise
 
 
 # =====================================================
@@ -153,21 +241,17 @@ def choose_token_limit(message):
         "calculate step by step"
     ]
 
-    # Detailed questions and derivations
     if any(term in text for term in detailed_terms):
         return ADVANCED_TOKENS
 
     word_count = len(text.split())
 
-    # Short questions
     if word_count <= 14 and len(text) <= 100:
         return SIMPLE_TOKENS
 
-    # Normal questions
     if word_count <= 40 and len(text) <= 250:
         return NORMAL_TOKENS
 
-    # Longer questions
     return MAX_OUTPUT_TOKENS
 
 
@@ -445,9 +529,7 @@ def alpha_chat(message, history):
 
             if index == 0:
 
-                logger.info(
-                    "Trying backup model."
-                )
+                logger.info("Trying backup model.")
 
                 continue
 
@@ -718,7 +800,7 @@ def analyze_video(video_path, question):
 
 
 # =====================================================
-# 5. VIDEO GENERATION
+# 5. VIDEO GENERATION - 720P + FFMPEG
 # =====================================================
 
 def generate_video(prompt):
@@ -732,7 +814,9 @@ def generate_video(prompt):
 
     try:
 
-        logger.info("VIDEO GENERATION STARTED")
+        logger.info(
+            "720P VIDEO GENERATION STARTED"
+        )
 
         interaction = client.interactions.create(
             model=VIDEO_MODEL,
@@ -740,7 +824,7 @@ def generate_video(prompt):
             response_format={
                 "type": "video",
                 "aspect_ratio": "16:9",
-                "resolution": "360p"
+                "resolution": VIDEO_RESOLUTION
             }
         )
 
@@ -824,18 +908,44 @@ def generate_video(prompt):
         if os.path.getsize(output_path) == 0:
             return None, "Generated video file is empty."
 
+        # FFMPEG 720P CONVERSION
+
+        logger.info("STARTING FFMPEG 720P PROCESSING")
+
+        original_path = output_path
+
+        try:
+
+            output_path = convert_video_720p(
+                original_path
+            )
+
+            try:
+                os.remove(original_path)
+            except OSError:
+                pass
+
+        except Exception:
+
+            logger.exception("FFMPEG FAILED")
+
+            return None, "Video was generated, but FFmpeg processing failed."
+
         elapsed = time.monotonic() - start
 
         logger.info(
-            "VIDEO GENERATED: %.2f seconds",
+            "720P VIDEO COMPLETE: %.2f seconds",
             elapsed
         )
 
         return (
             output_path,
             (
-                "360p video generated successfully!\n\n"
-                f"Time: {elapsed:.2f} seconds."
+                "720p video generated successfully!\n\n"
+                "Resolution: 1280 × 720\n"
+                "Frame rate: 24 FPS\n"
+                "Format: MP4\n"
+                f"Total time: {elapsed:.2f} seconds."
             )
         )
 
@@ -1050,7 +1160,11 @@ with gr.Blocks(
 
                 Generate videos from text descriptions.
 
-                Resolution: 360p
+                Resolution: 720p (1280 × 720)
+
+                Frame rate: 24 FPS
+
+                Format: MP4
                 """
             )
 
@@ -1107,7 +1221,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info("STARTING ALPHA AI 4.3")
+    logger.info("STARTING ALPHA AI 4.4")
 
     app.launch(
         server_name="0.0.0.0",
@@ -1118,4 +1232,4 @@ if __name__ == "__main__":
         ),
         css=CSS,
         show_error=True
-    )
+        )
