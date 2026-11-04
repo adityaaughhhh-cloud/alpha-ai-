@@ -3,6 +3,7 @@ import io
 import time
 import logging
 import threading
+import re
 
 from datetime import date
 
@@ -14,7 +15,9 @@ from google.genai import types
 
 
 # =====================================================
-# ALPHA AI 4.5 - CHAT + IMAGE ANALYSIS + VIDEO ANALYSIS
+# ALPHA AI 4.6
+# CHAT + IMAGE ANALYSIS + VIDEO ANALYSIS
+# CLEAN MATHEMATICAL FORMATTING
 # =====================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +93,7 @@ DETAILED ANSWER RULES:
     provide the mathematical steps.
 
 12. When equations are needed,
-    explain what each important symbol means.
+    explain important symbols.
 
 13. Do not skip important calculation steps.
 
@@ -98,13 +101,148 @@ DETAILED ANSWER RULES:
     organize the answer into numbered steps.
 
 15. When the user asks for a detailed explanation,
-    provide enough information to answer completely.
+    provide enough information.
 
-16. Do not deliberately shorten an answer
-    when the user requests a full explanation.
+16. Do not deliberately shorten detailed answers.
+
+MATHEMATICAL FORMATTING RULES:
+
+17. NEVER use LaTeX formatting.
+
+18. NEVER use dollar signs ($) around equations.
+
+19. NEVER output raw LaTeX commands.
+
+20. Avoid commands such as:
+    \\frac, \\text, \\sqrt, \\times, \\div.
+
+21. Write mathematical equations in plain text.
+
+22. Use normal mathematical symbols:
+    +, -, ×, ÷, =, ≥, ≤.
+
+23. Write chemical formulas clearly:
+    H2O, NaOH, CO2, H2SO4.
+
+24. Write units normally:
+    g/mol, kg, m/s, joules.
+
+25. Do not put unnecessary symbols
+    around mathematical expressions.
+
+26. Use readable numbered calculations.
+
+27. Never output Markdown math delimiters.
 
 Prioritize accuracy, clarity and useful answers.
 """
+
+
+# =====================================================
+# MATHEMATICAL FORMAT CLEANER
+# =====================================================
+
+def clean_math_format(text):
+
+    if not text:
+        return ""
+
+    # Remove LaTeX display delimiters
+    text = text.replace("$$", "")
+    text = text.replace("\\(", "")
+    text = text.replace("\\)", "")
+    text = text.replace("\\[", "")
+    text = text.replace("\\]", "")
+
+    # Remove dollar signs
+    text = text.replace("$", "")
+
+    # Convert common mathematical commands
+    replacements = {
+
+        r"\times": "×",
+        r"\cdot": "·",
+        r"\div": "÷",
+        r"\pm": "±",
+        r"\neq": "≠",
+        r"\leq": "≤",
+        r"\geq": "≥",
+        r"\approx": "≈",
+        r"\pi": "π",
+        r"\infty": "∞",
+        r"\rightarrow": "→",
+        r"\Rightarrow": "⇒",
+        r"\degree": "°",
+        r"\%": "%",
+        r"\sqrt": "√",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\theta": "θ",
+        r"\Delta": "Δ",
+        r"\lambda": "λ",
+        r"\mu": "μ",
+        r"\omega": "ω",
+        r"\Omega": "Ω",
+        r"\sigma": "σ",
+
+    }
+
+    for old, new in replacements.items():
+
+        text = text.replace(old, new)
+
+    # Convert simple fractions
+    text = re.sub(
+        r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}",
+        r"(\1)/(\2)",
+        text
+    )
+
+    # Convert text commands
+    text = re.sub(
+        r"\\text\s*\{([^{}]*)\}",
+        r"\1",
+        text
+    )
+
+    text = re.sub(
+        r"\\mathrm\s*\{([^{}]*)\}",
+        r"\1",
+        text
+    )
+
+    text = re.sub(
+        r"\\mathbf\s*\{([^{}]*)\}",
+        r"\1",
+        text
+    )
+
+    # Remove remaining LaTeX spacing commands
+    text = re.sub(
+        r"\\(?:quad|qquad|,|;|!|:)",
+        " ",
+        text
+    )
+
+    # Remove remaining unnecessary braces
+    text = text.replace("{", "")
+    text = text.replace("}", "")
+
+    # Remove unnecessary backslashes
+    text = re.sub(
+        r"\\([A-Za-z]+)",
+        r"\1",
+        text
+    )
+
+    # Clean excessive spaces
+    text = re.sub(
+        r"[ \t]{2,}",
+        " ",
+        text
+    )
+
+    return text.strip()
 
 
 # =====================================================
@@ -116,6 +254,7 @@ def choose_token_limit(message):
     text = message.strip().lower()
 
     detailed_terms = [
+
         "derive",
         "derivation",
         "mathematically",
@@ -132,20 +271,24 @@ def choose_token_limit(message):
         "comprehensive",
         "explain fully",
         "calculate step by step"
+
     ]
 
     if any(
         term in text
         for term in detailed_terms
     ):
+
         return ADVANCED_TOKENS
 
     word_count = len(text.split())
 
     if word_count <= 14 and len(text) <= 100:
+
         return SIMPLE_TOKENS
 
     if word_count <= 40 and len(text) <= 250:
+
         return NORMAL_TOKENS
 
     return MAX_OUTPUT_TOKENS
@@ -177,14 +320,19 @@ def prepare_history(history):
             continue
 
         contents.append(
+
             types.Content(
+
                 role="user" if role == "user" else "model",
+
                 parts=[
                     types.Part.from_text(
                         text=content
                     )
                 ]
+
             )
+
         )
 
     return contents
@@ -203,36 +351,42 @@ def get_error(error):
     message = str(error).lower()
 
     if "429" in message or "quota" in message:
+
         return (
             "API quota reached. "
             "Please try again later."
         )
 
     if "503" in message or "overloaded" in message:
+
         return (
             "Alpha AI is experiencing high demand. "
             "Try again shortly."
         )
 
     if "404" in message:
+
         return (
             "The selected AI model is unavailable. "
             "Check the model configuration."
         )
 
     if "403" in message:
+
         return (
             "API access denied. "
             "Check Google API permissions."
         )
 
     if "timeout" in message:
+
         return (
             "The request took too long. "
             "Please try again."
         )
 
     if "api key" in message:
+
         return (
             "There is a problem with the Gemini API key."
         )
@@ -261,14 +415,19 @@ def alpha_chat(message, history):
     contents = prepare_history(history)
 
     contents.append(
+
         types.Content(
+
             role="user",
+
             parts=[
                 types.Part.from_text(
                     text=message
                 )
             ]
+
         )
+
     )
 
     token_limit = choose_token_limit(
@@ -276,9 +435,13 @@ def alpha_chat(message, history):
     )
 
     config = types.GenerateContentConfig(
+
         system_instruction=SYSTEM_INSTRUCTION,
+
         temperature=0.3,
+
         max_output_tokens=token_limit
+
     )
 
     models = [
@@ -299,9 +462,13 @@ def alpha_chat(message, history):
             )
 
             stream = client.models.generate_content_stream(
+
                 model=model,
+
                 contents=contents,
+
                 config=config
+
             )
 
             for chunk in stream:
@@ -310,7 +477,9 @@ def alpha_chat(message, history):
 
                     answer += chunk.text
 
-                    yield answer
+                    yield clean_math_format(
+                        answer
+                    )
 
             if answer:
 
@@ -337,7 +506,7 @@ def alpha_chat(message, history):
 
             if answer:
 
-                yield (
+                yield clean_math_format(
                     answer
                     + "\n\nConnection interrupted."
                 )
@@ -363,6 +532,7 @@ def alpha_chat(message, history):
 def analyze_image(image_path, question):
 
     if not image_path:
+
         return "Please upload an image."
 
     if not question or not question.strip():
@@ -398,35 +568,53 @@ def analyze_image(image_path, question):
             image_bytes = buffer.getvalue()
 
         contents = [
+
             types.Content(
+
                 role="user",
+
                 parts=[
+
                     types.Part.from_bytes(
                         data=image_bytes,
                         mime_type="image/jpeg"
                     ),
+
                     types.Part.from_text(
                         text=question.strip()
                     )
+
                 ]
+
             )
+
         ]
 
         config = types.GenerateContentConfig(
+
             system_instruction=SYSTEM_INSTRUCTION,
+
             temperature=0.3,
+
             max_output_tokens=1024
+
         )
 
         response = client.models.generate_content(
+
             model=CHAT_MODEL,
+
             contents=contents,
+
             config=config
+
         )
 
-        answer = (
+        answer = clean_math_format(
+
             response.text
             or "No analysis generated."
+
         )
 
         elapsed = (
@@ -439,8 +627,11 @@ def analyze_image(image_path, question):
         )
 
         return (
+
             answer
+
             + f"\n\nAnalysis time: {elapsed:.2f} seconds."
+
         )
 
     except Exception as error:
@@ -474,6 +665,7 @@ def get_file_state(video_file):
 def analyze_video(video_path, question):
 
     if not video_path:
+
         return "Please upload a video."
 
     if not question or not question.strip():
@@ -509,6 +701,7 @@ def analyze_video(video_path, question):
             )
 
             if state == "ACTIVE":
+
                 break
 
             if state == "FAILED":
@@ -518,8 +711,11 @@ def analyze_video(video_path, question):
                 )
 
             if (
+
                 time.monotonic() - processing_start
+
                 > VIDEO_TIMEOUT
+
             ):
 
                 return (
@@ -529,35 +725,59 @@ def analyze_video(video_path, question):
             time.sleep(3)
 
         contents = [
+
             types.Content(
+
                 role="user",
+
                 parts=[
+
                     types.Part.from_uri(
+
                         file_uri=video_file.uri,
+
                         mime_type=video_file.mime_type
+
                     ),
+
                     types.Part.from_text(
+
                         text=question.strip()
+
                     )
+
                 ]
+
             )
+
         ]
 
         config = types.GenerateContentConfig(
+
             system_instruction=SYSTEM_INSTRUCTION,
+
             temperature=0.3,
+
             max_output_tokens=1024
+
         )
 
         response = client.models.generate_content(
+
             model=CHAT_MODEL,
+
             contents=contents,
+
             config=config
+
         )
 
-        answer = (
+        answer = clean_math_format(
+
             response.text
+
             or "No video analysis generated."
+
         )
 
         elapsed = (
@@ -570,8 +790,11 @@ def analyze_video(video_path, question):
         )
 
         return (
+
             answer
+
             + f"\n\nAnalysis time: {elapsed:.2f} seconds."
+
         )
 
     except Exception as error:
@@ -646,13 +869,19 @@ with gr.Blocks(
 ) as app:
 
     gr.HTML(
+
         """
         <div id="alpha-header">
+
             <h1>🚀 ALPHA AI</h1>
+
             <p>THINK BEYOND LIMITS</p>
+
             <p>Your intelligent AI assistant.</p>
+
         </div>
         """
+
     )
 
     with gr.Tabs():
@@ -662,22 +891,36 @@ with gr.Blocks(
         with gr.Tab("💬 Chat"):
 
             gr.ChatInterface(
+
                 fn=alpha_chat,
+
                 title="Alpha AI",
+
                 description=(
+
                     "Ask anything. "
                     "Get fast and intelligent answers."
+
                 ),
+
                 chatbot=gr.Chatbot(
                     height=530
                 ),
+
                 textbox=gr.Textbox(
+
                     placeholder="Message Alpha AI...",
+
                     container=True,
+
                     scale=7,
+
                     submit_btn="Send",
+
                     stop_btn="Stop"
+
                 )
+
             )
 
         # IMAGE ANALYSIS
@@ -689,29 +932,45 @@ with gr.Blocks(
             )
 
             image_input = gr.Image(
+
                 label="Upload Image",
+
                 type="filepath"
+
             )
 
             image_question = gr.Textbox(
+
                 label="Ask Alpha",
+
                 placeholder="What is in this image?"
+
             )
 
             image_analyze_button = gr.Button(
+
                 "Analyze Image",
+
                 variant="primary"
+
             )
 
             image_analysis_output = gr.Markdown()
 
             image_analyze_button.click(
+
                 fn=analyze_image,
+
                 inputs=[
+
                     image_input,
+
                     image_question
+
                 ],
+
                 outputs=image_analysis_output
+
             )
 
         # VIDEO ANALYSIS
@@ -723,41 +982,63 @@ with gr.Blocks(
             )
 
             video_input = gr.Video(
+
                 label="Upload Video",
+
                 sources=["upload"]
+
             )
 
             video_question = gr.Textbox(
+
                 label="Ask Alpha",
+
                 placeholder=(
+
                     "Explain what happens in this video."
+
                 )
+
             )
 
             video_analyze_button = gr.Button(
+
                 "Analyze Video",
+
                 variant="primary"
+
             )
 
             video_analysis_output = gr.Markdown()
 
             video_analyze_button.click(
+
                 fn=analyze_video,
+
                 inputs=[
+
                     video_input,
+
                     video_question
+
                 ],
+
                 outputs=video_analysis_output
+
             )
 
     gr.Markdown(
+
         """
+
         ---
 
         **ALPHA AI** | Think Beyond Limits
 
         Powered by Google Gemini.
+
         """
+
     )
 
 
@@ -766,8 +1047,11 @@ with gr.Blocks(
 # =====================================================
 
 app.queue(
+
     max_size=20,
+
     default_concurrency_limit=2
+
 )
 
 
@@ -778,16 +1062,25 @@ app.queue(
 if __name__ == "__main__":
 
     logger.info(
-        "STARTING ALPHA AI 4.5"
+        "STARTING ALPHA AI 4.6"
     )
 
     app.launch(
+
         server_name="0.0.0.0",
+
         server_port=PORT,
+
         theme=gr.themes.Soft(
+
             primary_hue="blue",
+
             secondary_hue="slate"
+
         ),
+
         css=CSS,
+
         show_error=True
-                )
+
+    )
