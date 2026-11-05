@@ -361,7 +361,7 @@ def make_image_response(prompt, style, extra, aspect_ratio, image_size,
         model = IMAGE_PRO_MODEL if image_size == "4K" else IMAGE_MODEL
         response_format = {
             "type": "image",
-            "mime_type": "image/png",
+            "mime_type": "image/jpeg",
             "aspect_ratio": aspect_ratio,
             "image_size": image_size
         }
