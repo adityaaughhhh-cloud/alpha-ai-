@@ -1,3 +1,4 @@
 gradio
 google-genai
 Pillow
+requests
