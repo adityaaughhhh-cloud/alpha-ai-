@@ -5,7 +5,7 @@ import time
 import uuid
 import base64
 import logging
-import mimetypes
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,15 +17,22 @@ from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 5.0
-# Chat + Image Generation/Edit + Storage + Image Tools
-# + Image Analysis + Video Analysis
+# ALPHA AI 5.1
+# Chat + Faster Image Generation/Edit + Storage
+# + Image Tools + Image Analysis + Video Analysis
 #
-# Storage:
-# - Supabase Storage when configured (persistent)
-# - Local temporary storage as a fallback (not persistent on Render)
+# IMAGE SPEED NOTES:
+# - Uses Gemini 3.1 Flash Image for 512px/1K/2K.
+# - Defaults to 512px to reduce output size and cost.
+# - Uses JPEG output because the Interactions API currently
+#   supports image/jpeg as its response MIME type.
+# - Image API request has a 45-second timeout by default.
+# - Supabase upload runs in the background so it does not
+#   delay showing the generated image.
 #
 # IMPORTANT:
+# - A 15–20 second generation time cannot be guaranteed.
+#   Google controls model processing time and availability.
 # - Never put API keys in this file.
 # - Configure secrets in Render Environment Variables.
 # ============================================================
@@ -40,15 +47,16 @@ if not API_KEY:
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-3.5-flash-lite")
 BACKUP_MODEL = os.environ.get("BACKUP_MODEL", "gemini-3.1-flash-lite")
 
-# Current Gemini image model IDs. Change these through Render env vars if needed.
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gemini-3.1-flash-image")
 IMAGE_PRO_MODEL = os.environ.get("IMAGE_PRO_MODEL", "gemini-3-pro-image")
 
+# Keep image calls from waiting for several minutes.
+# Increase this in Render only if the image service regularly needs longer.
+IMAGE_REQUEST_TIMEOUT = int(os.environ.get("IMAGE_REQUEST_TIMEOUT", "45"))
 VIDEO_TIMEOUT = int(os.environ.get("VIDEO_TIMEOUT", "100"))
 PORT = int(os.environ.get("PORT", "10000"))
 CHAT_HISTORY_LIMIT = 5
 
-# Supabase Storage configuration. Keep the service-role key secret.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "alpha-images")
@@ -57,6 +65,9 @@ LOCAL_IMAGE_DIR = Path(os.environ.get("ALPHA_IMAGE_DIR", "/tmp/alpha-images"))
 LOCAL_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 client = genai.Client(api_key=API_KEY)
+
+# One reusable HTTP session for image API calls.
+image_http = requests.Session()
 
 
 # ============================================================
@@ -140,8 +151,11 @@ def get_error(error):
         return "The selected model or API endpoint is unavailable. Check the model setting."
     if "403" in message or "permission" in message:
         return "API access denied. Check API permissions and billing configuration."
-    if "timeout" in message:
-        return "The request took too long. Please try again."
+    if "timeout" in message or "timed out" in message:
+        return (
+            f"Image/AI request exceeded its time limit. "
+            f"Please retry. Current image timeout: {IMAGE_REQUEST_TIMEOUT} seconds."
+        )
     if "api key" in message or "unauthorized" in message:
         return "There is a problem with the Gemini API key."
     return "Alpha AI could not complete the request. Please try again."
@@ -201,7 +215,7 @@ def image_to_bytes(image_path, max_side=1800):
         image = ImageOps.exif_transpose(source).convert("RGB")
         image.thumbnail((max_side, max_side))
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=90, optimize=True)
+        image.save(buffer, format="JPEG", quality=88)
         return buffer.getvalue(), "image/jpeg"
 
 
@@ -248,7 +262,7 @@ STYLE_GUIDANCE = {
 
 
 def understand_and_enhance_prompt(user_prompt, style, extra_instructions):
-    """A lightweight prompt-structuring layer; it does not make a second AI API call."""
+    """Local prompt formatting only; this does not make a second AI API call."""
     prompt = (user_prompt or "").strip()
     if not prompt:
         raise ValueError("Enter a description of the image you want.")
@@ -258,7 +272,7 @@ def understand_and_enhance_prompt(user_prompt, style, extra_instructions):
     categories = {
         "portrait": ("portrait", "person", "people", "face", "character"),
         "nature": ("forest", "mountain", "ocean", "river", "flower", "animal"),
-        "space": ("galaxy", "planet", "space", "nebula", "astronaut", "star"),
+        "space": ("saturn", "planet", "galaxy", "space", "nebula", "astronaut", "star"),
         "architecture": ("building", "house", "architecture", "interior", "room"),
         "product": ("product", "bottle", "shoe", "watch", "phone", "mug"),
         "poster/design": ("poster", "banner", "logo", "advertisement", "flyer")
@@ -271,11 +285,11 @@ def understand_and_enhance_prompt(user_prompt, style, extra_instructions):
     sections = [
         "Create one original image based on the user's request.",
         f"User's exact creative brief: {prompt}",
-        f"Detected subject category (guidance only): {category}.",
-        "Preserve the requested subject, objects, relationships, and important details.",
+        f"Subject category (guidance only): {category}.",
+        "Preserve the requested subject and important details.",
         "Use a coherent composition, clear subject separation, consistent perspective, "
-        "believable lighting, intentional color, and carefully rendered details.",
-        "Do not add unrelated objects, captions, logos, signatures, or watermarks unless requested."
+        "believable lighting and carefully rendered details.",
+        "Do not add unrelated objects, captions, logos, signatures or watermarks unless requested."
     ]
     guidance = STYLE_GUIDANCE.get(style or "Automatic", "")
     if guidance:
@@ -286,51 +300,83 @@ def understand_and_enhance_prompt(user_prompt, style, extra_instructions):
 
 
 # ============================================================
-# 4. IMAGE GENERATION + EDITING ENGINE
+# 4. IMAGE GENERATION + EDITING
 # ============================================================
 
-def extract_generated_image(interaction):
-    """Read the image block from the Gemini Interactions response."""
-    output_image = getattr(interaction, "output_image", None)
-    if output_image and getattr(output_image, "data", None):
-        data = output_image.data
-        if isinstance(data, str):
-            return base64.b64decode(data)
-        return data
+def extract_image_from_api_response(data):
+    """Extract the base64 image from the Interactions API JSON response."""
+    output_image = data.get("output_image")
+    if isinstance(output_image, dict) and output_image.get("data"):
+        return base64.b64decode(output_image["data"])
 
-    # Fallback for responses that expose image blocks through steps.
-    for step in getattr(interaction, "steps", []) or []:
-        if getattr(step, "type", None) == "model_output":
-            for block in getattr(step, "content", []) or []:
-                if getattr(block, "type", None) == "image" and getattr(block, "data", None):
-                    data = block.data
-                    return base64.b64decode(data) if isinstance(data, str) else data
-    raise RuntimeError("The image model returned no image. Try a different prompt or model.")
+    for step in data.get("steps", []) or []:
+        if step.get("type") == "model_output":
+            for block in step.get("content", []) or []:
+                if block.get("type") == "image" and block.get("data"):
+                    return base64.b64decode(block["data"])
+
+    raise RuntimeError(
+        "Google returned a response, but Alpha could not find an image in it."
+    )
 
 
-def save_generated_image(image_bytes, extension="png"):
+def call_gemini_image_api(model, api_input, aspect_ratio, image_size):
+    """Call the official Interactions REST endpoint with a firm request timeout."""
+    endpoint = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    headers = {
+        "x-goog-api-key": API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "input": api_input,
+        "response_format": {
+            "type": "image",
+            "mime_type": "image/jpeg",
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size
+        }
+    }
+
+    response = image_http.post(
+        endpoint,
+        headers=headers,
+        json=payload,
+        timeout=(10, IMAGE_REQUEST_TIMEOUT)
+    )
+
+    if not response.ok:
+        try:
+            error_data = response.json()
+            message = error_data.get("error", {}).get("message", response.text)
+        except Exception:
+            message = response.text[:1000]
+        raise RuntimeError(f"Gemini image API returned HTTP {response.status_code}: {message}")
+
+    return extract_image_from_api_response(response.json())
+
+
+def save_generated_image(image_bytes):
+    """Save generated JPEG without expensive PNG optimization."""
     image_id = uuid.uuid4().hex
-    local_path = LOCAL_IMAGE_DIR / f"{image_id}.{extension}"
+    local_path = LOCAL_IMAGE_DIR / f"{image_id}.jpg"
     with Image.open(io.BytesIO(image_bytes)) as source:
-        image = ImageOps.exif_transpose(source)
-        image.save(local_path, format="PNG", optimize=True)
-    return local_path, image_id
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.save(local_path, format="JPEG", quality=92)
+        display_image = image.copy()
+    return local_path, image_id, display_image
 
 
 # ============================================================
-# 5. PERSISTENT STORAGE ENGINE (SUPABASE STORAGE)
+# 5. PERSISTENT STORAGE (BACKGROUND UPLOAD)
 # ============================================================
 
-def store_image(image_bytes, image_id, prompt, mime_type="image/png"):
-    """
-    Upload to a public Supabase Storage bucket.
-    Configure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET.
-    The service-role key must remain private in Render environment variables.
-    """
+def store_image(image_bytes, image_id, prompt, mime_type="image/jpeg"):
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
-        return None, "Local temporary copy only; persistent storage is not configured."
+        logger.info("Supabase is not configured; image remains in temporary local storage.")
+        return
 
-    safe_name = f"{datetime.now(timezone.utc):%Y/%m}/{image_id}.png"
+    safe_name = f"{datetime.now(timezone.utc):%Y/%m}/{image_id}.jpg"
     endpoint = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{safe_name}"
     headers = {
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -339,61 +385,73 @@ def store_image(image_bytes, image_id, prompt, mime_type="image/png"):
         "x-upsert": "true"
     }
     try:
-        response = requests.post(endpoint, headers=headers, data=image_bytes, timeout=45)
-        response.raise_for_status()
-        public_url = (
-            f"{SUPABASE_URL}/storage/v1/object/public/"
-            f"{SUPABASE_BUCKET}/{safe_name}"
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            data=image_bytes,
+            timeout=(5, 15)
         )
-        return public_url, "Saved to persistent Supabase Storage."
-    except Exception as error:
-        logger.exception("SUPABASE STORAGE UPLOAD FAILED")
-        return None, f"Image generated, but cloud storage upload failed: {error}"
+        response.raise_for_status()
+        logger.info("Image %s saved to Supabase Storage.", image_id)
+    except Exception:
+        logger.exception("BACKGROUND SUPABASE STORAGE UPLOAD FAILED")
+
+
+def start_background_storage_upload(image_bytes, image_id, prompt):
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return
+    thread = threading.Thread(
+        target=store_image,
+        args=(image_bytes, image_id, prompt, "image/jpeg"),
+        daemon=True
+    )
+    thread.start()
 
 
 def make_image_response(prompt, style, extra, aspect_ratio, image_size,
                         reference_image, do_2x_resize):
     start = time.monotonic()
+
     try:
         enhanced_prompt = understand_and_enhance_prompt(prompt, style, extra)
 
-        # Pro model is selected for requested 4K output; Flash Image handles 1K/2K.
+        # 4K uses the Pro model; 512px/1K/2K use Flash Image.
         model = IMAGE_PRO_MODEL if image_size == "4K" else IMAGE_MODEL
-        response_format = {
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "aspect_ratio": aspect_ratio,
-            "image_size": image_size
-        }
 
         if reference_image:
-            ref_bytes, ref_mime = image_to_bytes(reference_image, max_side=2500)
-            interaction = client.interactions.create(
-                model=model,
-                input=[
-                    {"type": "text", "text": (
+            ref_bytes, ref_mime = image_to_bytes(reference_image, max_side=1600)
+            api_input = [
+                {
+                    "type": "text",
+                    "text": (
                         enhanced_prompt +
                         "\nUse the supplied reference image as the visual starting point. "
-                        "Apply the user's requested changes while preserving unrelated details."
-                    )},
-                    {
-                        "type": "image",
-                        "data": base64.b64encode(ref_bytes).decode("utf-8"),
-                        "mime_type": ref_mime
-                    }
-                ],
-                response_format=response_format
-            )
+                        "Apply the requested changes while preserving unrelated details."
+                    )
+                },
+                {
+                    "type": "image",
+                    "data": base64.b64encode(ref_bytes).decode("utf-8"),
+                    "mime_type": ref_mime
+                }
+            ]
         else:
-            interaction = client.interactions.create(
-                model=model,
-                input=enhanced_prompt,
-                response_format=response_format
-            )
+            api_input = enhanced_prompt
 
-        image_bytes = extract_generated_image(interaction)
+        logger.info(
+            "Starting image generation: model=%s size=%s ratio=%s timeout=%ss",
+            model, image_size, aspect_ratio, IMAGE_REQUEST_TIMEOUT
+        )
 
-        # Optional high-quality 2x pixel resize. This is NOT AI super-resolution.
+        # No automatic retry: a retry could double the wait time.
+        image_bytes = call_gemini_image_api(
+            model=model,
+            api_input=api_input,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size
+        )
+
+        # Optional pixel resize is deliberately disabled by default.
         if do_2x_resize:
             with Image.open(io.BytesIO(image_bytes)) as source:
                 upscaled = source.convert("RGB").resize(
@@ -401,16 +459,13 @@ def make_image_response(prompt, style, extra, aspect_ratio, image_size,
                     Image.Resampling.LANCZOS
                 )
                 buffer = io.BytesIO()
-                upscaled.save(buffer, format="PNG", optimize=True)
+                upscaled.save(buffer, format="JPEG", quality=92)
                 image_bytes = buffer.getvalue()
 
-        local_path, image_id = save_generated_image(image_bytes)
-        cloud_url, storage_message = store_image(
-            image_bytes, image_id, prompt, "image/png"
-        )
+        local_path, image_id, display_image = save_generated_image(image_bytes)
 
-        with Image.open(local_path) as saved:
-            display_image = saved.copy()
+        # Upload after returning the image; storage must not hold up the user.
+        start_background_storage_upload(image_bytes, image_id, prompt)
 
         elapsed = time.monotonic() - start
         details = [
@@ -418,22 +473,33 @@ def make_image_response(prompt, style, extra, aspect_ratio, image_size,
             f"- **Model:** `{model}`",
             f"- **Requested size:** {image_size}",
             f"- **Aspect ratio:** {aspect_ratio}",
-            f"- **Processing time:** {elapsed:.1f} seconds",
-            f"- **Storage:** {storage_message}"
+            f"- **Generation and local-save time:** {elapsed:.1f} seconds",
+            "- **Storage:** Image returned immediately; cloud backup runs in background."
+                if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+                else "- **Storage:** Temporary local copy only; Supabase is not configured.",
         ]
         if do_2x_resize:
             details.append("- **Resize:** 2× Lanczos resize (not AI super-resolution).")
-        if cloud_url:
-            details.append(f"- **Cloud image:** [Open saved image]({cloud_url})")
         details.append(f"- **Image ID:** `{image_id}`")
+        details.append(
+            "\nNote: generation speed depends on Google's service. "
+            "The request stops waiting after the configured timeout."
+        )
         return display_image, "\n".join(details)
 
+    except requests.exceptions.Timeout:
+        elapsed = time.monotonic() - start
+        logger.exception("IMAGE GENERATION TIMED OUT after %.1f seconds", elapsed)
+        return None, (
+            f"Image generation exceeded {IMAGE_REQUEST_TIMEOUT} seconds. "
+            "Google's image service did not finish in time. Please retry later."
+        )
     except Exception as error:
         return None, get_error(error)
 
 
 # ============================================================
-# 6. IMAGE UPSCALING / OPTIMIZATION TOOLS
+# 6. IMAGE RESIZING TOOL
 # ============================================================
 
 def resize_image_tool(image_path, scale):
@@ -447,8 +513,8 @@ def resize_image_tool(image_path, scale):
                 (image.width * factor, image.height * factor),
                 Image.Resampling.LANCZOS
             )
-            output = LOCAL_IMAGE_DIR / f"resize-{uuid.uuid4().hex}.png"
-            resized.save(output, format="PNG", optimize=True)
+            output = LOCAL_IMAGE_DIR / f"resize-{uuid.uuid4().hex}.jpg"
+            resized.save(output, format="JPEG", quality=92)
             result = resized.copy()
         return result, (
             f"Resized to {resized.width} × {resized.height} pixels using Lanczos. "
@@ -517,7 +583,7 @@ def analyze_video(video_path, question):
 
 
 # ============================================================
-# 8. UI
+# 8. USER INTERFACE
 # ============================================================
 
 CSS = """
@@ -555,12 +621,12 @@ with gr.Blocks(title="ALPHA AI") as app:
         with gr.Tab("🎨 Image Generator"):
             gr.Markdown(
                 "## Create or edit images\n"
-                "Describe the image. Optionally upload a reference image to edit."
+                "For the quickest first test, choose 512px and Automatic style."
             )
             prompt_input = gr.Textbox(
                 label="What image should Alpha create?",
-                placeholder="Example: A cinematic view of Saturn above an icy moon...",
-                lines=4
+                placeholder="Example: A realistic view of Saturn and its rings in deep space...",
+                lines=3
             )
             with gr.Row():
                 style_input = gr.Dropdown(
@@ -575,13 +641,13 @@ with gr.Blocks(title="ALPHA AI") as app:
                     label="Aspect ratio"
                 )
                 size_input = gr.Dropdown(
-                    choices=["1K", "2K", "4K"],
-                    value="1K",
-                    label="Output size"
+                    choices=["512", "1K", "2K", "4K"],
+                    value="512",
+                    label="Output size (512 is fastest to test)"
                 )
             extra_input = gr.Textbox(
                 label="Optional extra instructions",
-                placeholder="Colors, lighting, composition, details...",
+                placeholder="Colors, lighting, composition...",
                 lines=2
             )
             reference_input = gr.Image(
@@ -589,7 +655,7 @@ with gr.Blocks(title="ALPHA AI") as app:
                 type="filepath"
             )
             resize_checkbox = gr.Checkbox(
-                label="Apply optional 2× high-quality resize (not AI super-resolution)",
+                label="Apply optional 2× resize (not AI super-resolution)",
                 value=False
             )
             generate_button = gr.Button("Generate image", variant="primary")
@@ -607,8 +673,7 @@ with gr.Blocks(title="ALPHA AI") as app:
         with gr.Tab("🛠️ Image Tools"):
             gr.Markdown(
                 "## Image resizing and optimization\n"
-                "This tool enlarges pixels with Lanczos interpolation. It does not invent "
-                "new details like a dedicated AI super-resolution model."
+                "Lanczos resizing enlarges pixels; it does not reconstruct missing details."
             )
             resize_input = gr.Image(label="Upload image", type="filepath")
             scale_input = gr.Dropdown(
@@ -660,7 +725,7 @@ with gr.Blocks(title="ALPHA AI") as app:
 app.queue(max_size=20, default_concurrency_limit=2)
 
 if __name__ == "__main__":
-    logger.info("STARTING ALPHA AI 5.0")
+    logger.info("STARTING ALPHA AI 5.1")
     app.launch(
         server_name="0.0.0.0",
         server_port=PORT,
