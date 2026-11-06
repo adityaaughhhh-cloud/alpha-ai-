@@ -1,4 +1,4 @@
 gradio
-google-genai
-Pillow
 requests
+Pillow
+google-genai
