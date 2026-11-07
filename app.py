@@ -5,7 +5,6 @@ import time
 import base64
 import hashlib
 import logging
-import mimetypes
 
 from pathlib import Path
 from datetime import datetime
@@ -20,11 +19,11 @@ from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 12.0
-# CHAT + IMAGE STUDIO + IMAGE ANALYSIS + VIDEO ANALYSIS
+# ALPHA AI 13.0
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("ALPHA")
 
 
@@ -35,24 +34,31 @@ logger = logging.getLogger("ALPHA")
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
 
-SUPABASE_URL = os.environ.get(
-    "SUPABASE_URL", ""
-).rstrip("/")
-
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
-    "SUPABASE_SERVICE_ROLE_KEY"
-)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 QUOTA_SALT = os.environ.get("ALPHA_QUOTA_SALT")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Primary model
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     "gemini-3.8-flash"
 )
 
+# Backup model
+GEMINI_BACKUP_MODEL = os.environ.get(
+    "GEMINI_BACKUP_MODEL",
+    "gemini-3.1-flash-lite"
+)
+
+# API timeout in milliseconds
+API_TIMEOUT = 120000
+
 DAILY_IMAGE_LIMIT = 10
+
 IMAGE_TIMEOUT = 120
+
 VIDEO_MAX_SIZE = 50 * 1024 * 1024
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -77,12 +83,14 @@ required = {
 }
 
 missing = [
-    name for name, value in required.items() if not value
+    name for name, value in required.items()
+    if not value
 ]
 
 if missing:
     raise RuntimeError(
-        "Missing environment variables: " + ", ".join(missing)
+        "Missing environment variables: "
+        + ", ".join(missing)
     )
 
 if len(QUOTA_SALT) < 32:
@@ -100,7 +108,7 @@ http = requests.Session()
 gemini = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(
-        timeout=60000
+        timeout=API_TIMEOUT
     )
 )
 
@@ -112,10 +120,77 @@ CLOUDFLARE_URL = (
 
 
 # ============================================================
+# GEMINI RESPONSE FUNCTION
+# ============================================================
+
+def gemini_generate(contents, config, operation="Gemini"):
+
+    models = []
+
+    if GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
+
+    if (
+        GEMINI_BACKUP_MODEL
+        and GEMINI_BACKUP_MODEL not in models
+    ):
+        models.append(GEMINI_BACKUP_MODEL)
+
+    last_error = None
+
+    for model_name in models:
+
+        try:
+
+            logger.info(
+                "%s: trying model %s",
+                operation,
+                model_name
+            )
+
+            response = gemini.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
+
+            answer = response.text
+
+            if answer and answer.strip():
+
+                logger.info(
+                    "%s: successful response from %s",
+                    operation,
+                    model_name
+                )
+
+                return answer.strip()
+
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
+
+        except Exception as error:
+
+            last_error = error
+
+            logger.exception(
+                "%s failed with model %s",
+                operation,
+                model_name
+            )
+
+    raise RuntimeError(
+        operation + " failed with all configured models."
+    ) from last_error
+
+
+# ============================================================
 # DATE
 # ============================================================
 
 def today():
+
     return datetime.now(IST).date().isoformat()
 
 
@@ -128,11 +203,16 @@ def get_visitor(request):
     ip = "unknown"
 
     try:
+
         if request and request.client:
+
             ip = request.client.host or "unknown"
 
     except Exception:
-        logger.exception("VISITOR IDENTIFICATION ERROR")
+
+        logger.exception(
+            "VISITOR IDENTIFICATION ERROR"
+        )
 
     value = QUOTA_SALT + ":" + ip
 
@@ -179,8 +259,11 @@ def consume_image_quota(visitor):
 
     result = response.json()
 
-    if not isinstance(result, dict) or "allowed" not in result:
+    if not isinstance(result, dict):
         raise RuntimeError("Invalid quota response.")
+
+    if "allowed" not in result:
+        raise RuntimeError("Quota response missing allowed field.")
 
     return result
 
@@ -199,6 +282,7 @@ def refund_image_quota(visitor, usage_date):
     }
 
     try:
+
         response = http.post(
             endpoint,
             headers=supabase_headers(),
@@ -209,7 +293,10 @@ def refund_image_quota(visitor, usage_date):
         response.raise_for_status()
 
     except Exception:
-        logger.exception("IMAGE CREDIT REFUND FAILED")
+
+        logger.exception(
+            "IMAGE CREDIT REFUND FAILED"
+        )
 
 
 # ============================================================
@@ -217,28 +304,59 @@ def refund_image_quota(visitor, usage_date):
 # ============================================================
 
 STYLES = {
+
     "Automatic": "",
-    "Photorealistic": "Photorealistic image, realistic lighting and details.",
-    "Cinematic": "Cinematic composition and dramatic lighting.",
-    "Anime": "High quality anime illustration.",
-    "3D Render": "Professional detailed 3D render.",
-    "Digital Art": "Professional digital artwork.",
-    "Watercolor": "Traditional watercolor painting.",
-    "Oil Painting": "Detailed oil painting.",
-    "Pixel Art": "High quality pixel art.",
-    "Minimalist": "Clean minimalist artistic composition.",
-    "Product Photography": "Professional studio product photography."
+
+    "Photorealistic":
+        "Photorealistic image, realistic lighting and details.",
+
+    "Cinematic":
+        "Cinematic composition and dramatic lighting.",
+
+    "Anime":
+        "High quality anime illustration.",
+
+    "3D Render":
+        "Professional detailed 3D render.",
+
+    "Digital Art":
+        "Professional digital artwork.",
+
+    "Watercolor":
+        "Traditional watercolor painting.",
+
+    "Oil Painting":
+        "Detailed oil painting.",
+
+    "Pixel Art":
+        "High quality pixel art.",
+
+    "Minimalist":
+        "Clean minimalist artistic composition.",
+
+    "Product Photography":
+        "Professional studio product photography."
 }
 
+
 RATIOS = {
+
     "1:1": (720, 720),
+
     "16:9": (1280, 720),
+
     "9:16": (720, 1280),
+
     "4:3": (960, 720),
+
     "3:4": (720, 960),
+
     "3:2": (1080, 720),
+
     "2:3": (720, 1080),
+
     "21:9": (1680, 720)
+
 }
 
 
@@ -291,19 +409,29 @@ def generate_image(prompt):
         data = response.json()
 
         if not data.get("success"):
-            raise RuntimeError("Cloudflare generation failed.")
+            raise RuntimeError(
+                "Cloudflare generation failed."
+            )
 
-        encoded = data.get("result", {}).get("image")
+        encoded = data.get(
+            "result", {}
+        ).get("image")
 
         if not encoded:
-            raise RuntimeError("No image returned.")
+            raise RuntimeError(
+                "No image returned."
+            )
 
         image_bytes = base64.b64decode(encoded)
 
     else:
+
         image_bytes = response.content
 
-    with Image.open(io.BytesIO(image_bytes)) as image:
+    with Image.open(
+        io.BytesIO(image_bytes)
+    ) as image:
+
         image.verify()
 
     return image_bytes
@@ -316,10 +444,13 @@ def generate_image(prompt):
 def export_image(image_bytes, ratio="16:9"):
 
     width, height = RATIOS.get(
-        ratio, (1280, 720)
+        ratio,
+        (1280, 720)
     )
 
-    with Image.open(io.BytesIO(image_bytes)) as source:
+    with Image.open(
+        io.BytesIO(image_bytes)
+    ) as source:
 
         image = ImageOps.exif_transpose(
             source
@@ -358,13 +489,21 @@ def create_image(
 ):
 
     if not prompt or not prompt.strip():
-        raise ValueError("Enter an image description.")
+
+        raise ValueError(
+            "Enter an image description."
+        )
 
     if request is None:
-        raise RuntimeError("Request information unavailable.")
+
+        raise RuntimeError(
+            "Request information unavailable."
+        )
 
     visitor = get_visitor(request)
+
     usage_date = today()
+
     reserved = False
 
     try:
@@ -372,27 +511,36 @@ def create_image(
         quota = consume_image_quota(visitor)
 
         if not quota.get("allowed"):
+
             raise RuntimeError(
-                "Daily image limit reached. You can create 10 images per day."
+                "Daily image limit reached. "
+                "You can create 10 images per day."
             )
 
         reserved = True
 
         final_prompt = build_prompt(
-            prompt, style, extra
+            prompt,
+            style,
+            extra
         )
 
-        image_bytes = generate_image(final_prompt)
+        image_bytes = generate_image(
+            final_prompt
+        )
 
         return export_image(
-            image_bytes, ratio
+            image_bytes,
+            ratio
         )
 
     except Exception:
 
         if reserved:
+
             refund_image_quota(
-                visitor, usage_date
+                visitor,
+                usage_date
             )
 
         raise
@@ -409,6 +557,7 @@ def choose_tokens(question):
     question_lower = question.lower()
 
     detailed_terms = [
+
         "explain in detail",
         "step by step",
         "compare",
@@ -419,6 +568,7 @@ def choose_tokens(question):
         "comprehensive",
         "advanced",
         "detailed explanation"
+
     ]
 
     complex_question = any(
@@ -448,16 +598,22 @@ def normalize_history(history):
 
     for item in history or []:
 
-        if not isinstance(item, dict):
-            continue
+        if isinstance(item, dict):
 
-        role = item.get("role")
-        content = item.get("content")
+            role = item.get("role")
+            content = item.get("content")
+
+        else:
+
+            continue
 
         if role not in ("user", "assistant"):
             continue
 
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str):
+            continue
+
+        if not content.strip():
             continue
 
         result.append({
@@ -469,7 +625,8 @@ def normalize_history(history):
 
 
 # ============================================================
-# SIMPLE TEXT-ONLY CHAT
+# ALPHA CHAT
+# TEXT ONLY
 # NO IMAGE GENERATION
 # NO CLOUDFLARE
 # ============================================================
@@ -479,13 +636,14 @@ def chat_reply(message, history):
     history = normalize_history(history)
 
     if not message or not message.strip():
-        yield history
-        return
+
+        return history
 
     message = message.strip()
 
     contents = []
 
+    # Previous conversation
     for item in history[-12:]:
 
         role = item["role"]
@@ -504,6 +662,7 @@ def chat_reply(message, history):
             )
         )
 
+    # Current question
     contents.append(
         types.Content(
             role="user",
@@ -518,67 +677,53 @@ def chat_reply(message, history):
     config = types.GenerateContentConfig(
 
         system_instruction=(
-            "You are Alpha AI, a helpful, accurate and "
-            "intelligent text-only AI assistant. "
-            "Answer questions directly. "
-            "Explain difficult topics step by step. "
-            "For mathematics, show the working. "
-            "For science, explain concepts clearly. "
-            "Never attempt to generate images or videos. "
-            "You only provide text answers in this chat."
+            "You are Alpha AI, a helpful and accurate "
+            "text-only AI assistant. "
+            "Answer questions directly and clearly. "
+            "For mathematics, show calculations. "
+            "For science, explain concepts accurately. "
+            "For simple questions, give short answers. "
+            "For difficult questions, explain step by step. "
+            "Never generate images or videos in Chat. "
+            "Never call external image-generation services. "
+            "Only return text."
         ),
 
-        temperature=0.5,
+        temperature=0.3,
 
         max_output_tokens=choose_tokens(message)
 
     )
 
-    history.append({
+    updated_history = history + [{
         "role": "user",
         "content": message
-    })
-
-    answer = ""
+    }]
 
     try:
 
-        stream = gemini.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=config
+        answer = gemini_generate(
+            contents,
+            config,
+            operation="CHAT"
         )
 
-        for chunk in stream:
-
-            text = getattr(chunk, "text", None)
-
-            if text:
-
-                answer += text
-
-                yield history + [{
-                    "role": "assistant",
-                    "content": answer
-                }]
-
-        if not answer.strip():
-            answer = "I couldn't generate an answer. Please try again."
-
-        yield history + [{
+        return updated_history + [{
             "role": "assistant",
             "content": answer
         }]
 
     except Exception:
 
-        logger.exception("CHAT ERROR")
+        logger.exception(
+            "ALPHA CHAT FAILED"
+        )
 
-        yield history + [{
+        return updated_history + [{
             "role": "assistant",
             "content": (
                 "Alpha is temporarily unable to answer. "
-                "Please try again."
+                "Please try again in a moment."
             )
         }]
 
@@ -590,10 +735,14 @@ def chat_reply(message, history):
 def analyze_image(image_path, question):
 
     if not image_path:
+
         return "Please upload an image first."
 
     if not question or not question.strip():
-        question = "Describe this image and its important details."
+
+        question = (
+            "Describe this image and its important details."
+        )
 
     try:
 
@@ -613,31 +762,38 @@ def analyze_image(image_path, question):
 
             image_bytes = buffer.getvalue()
 
-        response = gemini.models.generate_content(
+        contents = [
 
-            model=GEMINI_MODEL,
+            question,
 
-            contents=[
-                question,
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg"
-                )
-            ],
-
-            config=types.GenerateContentConfig(
-                max_output_tokens=1200
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg"
             )
 
+        ]
+
+        config = types.GenerateContentConfig(
+            max_output_tokens=1200,
+            temperature=0.3
         )
 
-        return response.text or "No analysis returned."
+        return gemini_generate(
+            contents,
+            config,
+            operation="IMAGE ANALYSIS"
+        )
 
     except Exception:
 
-        logger.exception("IMAGE ANALYSIS ERROR")
+        logger.exception(
+            "IMAGE ANALYSIS ERROR"
+        )
 
-        return "Image analysis failed. Please try again."
+        return (
+            "Image analysis failed. "
+            "Please try again."
+        )
 
 
 # ============================================================
@@ -651,15 +807,17 @@ def generate_from_image_analysis(
 ):
 
     if not image_path or not description:
+
         return None, None
 
     analysis = analyze_image(
         image_path,
-        "Describe this image for creating a new image. User request: "
-        + description
+        "Describe this image for creating a new image. "
+        "User request: " + description
     )
 
     if "analysis failed" in analysis.lower():
+
         return None, None
 
     prompt = (
@@ -681,7 +839,9 @@ def generate_from_image_analysis(
 
     except Exception:
 
-        logger.exception("IMAGE VARIATION ERROR")
+        logger.exception(
+            "IMAGE VARIATION ERROR"
+        )
 
         return None, None
 
@@ -693,10 +853,15 @@ def generate_from_image_analysis(
 def get_video_path(video):
 
     if isinstance(video, str):
+
         return video
 
     if isinstance(video, dict):
-        return video.get("video") or video.get("path")
+
+        return (
+            video.get("video")
+            or video.get("path")
+        )
 
     return None
 
@@ -710,6 +875,7 @@ def analyze_video(video, question):
     video_path = get_video_path(video)
 
     if not video_path:
+
         return "Please upload a video first."
 
     uploaded = None
@@ -717,20 +883,26 @@ def analyze_video(video, question):
     try:
 
         if not os.path.isfile(video_path):
+
             return "Video file not found."
 
-        file_size = os.path.getsize(video_path)
+        file_size = os.path.getsize(
+            video_path
+        )
 
         if file_size > VIDEO_MAX_SIZE:
+
             return "Video must be smaller than 50 MB."
 
         if file_size == 0:
+
             return "The video file is empty."
 
         uploaded = gemini.files.upload(
             file=video_path
         )
 
+        # Wait for video processing
         for _ in range(90):
 
             uploaded = gemini.files.get(
@@ -738,65 +910,86 @@ def analyze_video(video, question):
             )
 
             state = getattr(
-                uploaded, "state", None
+                uploaded,
+                "state",
+                None
             )
 
             state_name = getattr(
-                state, "name", str(state)
+                state,
+                "name",
+                str(state)
             ).upper()
 
             if state_name == "ACTIVE":
                 break
 
             if state_name == "FAILED":
-                raise RuntimeError("Video processing failed.")
+
+                raise RuntimeError(
+                    "Video processing failed."
+                )
 
             time.sleep(2)
 
         else:
-            raise TimeoutError("Video processing timed out.")
+
+            raise TimeoutError(
+                "Video processing timed out."
+            )
 
         if not question or not question.strip():
 
             question = (
-                "Summarize this video and explain its "
-                "important visual scenes."
+                "Summarize this video and explain "
+                "its important visual scenes."
             )
 
-        response = gemini.models.generate_content(
+        contents = [
+            uploaded,
+            question
+        ]
 
-            model=GEMINI_MODEL,
+        config = types.GenerateContentConfig(
 
-            contents=[
-                uploaded,
-                question
-            ],
+            max_output_tokens=1500,
 
-            config=types.GenerateContentConfig(
-                max_output_tokens=1500
-            )
+            temperature=0.3
 
         )
 
-        return response.text or "No video analysis returned."
+        return gemini_generate(
+            contents,
+            config,
+            operation="VIDEO ANALYSIS"
+        )
 
     except Exception:
 
-        logger.exception("VIDEO ANALYSIS ERROR")
+        logger.exception(
+            "VIDEO ANALYSIS ERROR"
+        )
 
-        return "Video analysis failed. Please try again."
+        return (
+            "Video analysis failed. "
+            "Please try again."
+        )
 
     finally:
 
         if uploaded is not None:
 
             try:
+
                 gemini.files.delete(
                     name=uploaded.name
                 )
 
             except Exception:
-                logger.exception("VIDEO FILE CLEANUP ERROR")
+
+                logger.exception(
+                    "VIDEO FILE CLEANUP ERROR"
+                )
 
 
 # ============================================================
@@ -810,6 +1003,7 @@ def generate_from_video(
 ):
 
     if not get_video_path(video):
+
         return None, None
 
     analysis = analyze_video(
@@ -822,6 +1016,7 @@ def generate_from_video(
     )
 
     if "failed" in analysis.lower():
+
         return None, None
 
     prompt = (
@@ -843,7 +1038,9 @@ def generate_from_video(
 
     except Exception:
 
-        logger.exception("VIDEO IMAGE GENERATION ERROR")
+        logger.exception(
+            "VIDEO IMAGE GENERATION ERROR"
+        )
 
         return None, None
 
@@ -874,7 +1071,9 @@ def make_image(
 
     except Exception:
 
-        logger.exception("IMAGE STUDIO ERROR")
+        logger.exception(
+            "IMAGE STUDIO ERROR"
+        )
 
         return None, None
 
@@ -927,7 +1126,12 @@ textarea {
 # ============================================================
 
 with gr.Blocks(
-    title="ALPHA AI - Think Beyond Limits"
+    title="ALPHA AI - Think Beyond Limits",
+    css=CSS,
+    theme=gr.themes.Soft(
+        primary_hue="blue",
+        secondary_hue="slate"
+    )
 ) as app:
 
     gr.HTML("""
@@ -941,7 +1145,7 @@ with gr.Blocks(
     with gr.Tabs():
 
         # ====================================================
-        # CHAT - TEXT ONLY
+        # CHAT
         # ====================================================
 
         with gr.Tab("💬 Chat"):
@@ -957,10 +1161,16 @@ with gr.Blocks(
                 lines=2
             )
 
-            chat_send = gr.Button(
-                "Send",
-                variant="primary"
-            )
+            with gr.Row():
+
+                chat_send = gr.Button(
+                    "Send",
+                    variant="primary"
+                )
+
+                chat_clear = gr.Button(
+                    "Clear Chat"
+                )
 
             chat_send.click(
                 fn=chat_reply,
@@ -986,6 +1196,14 @@ with gr.Blocks(
             ).then(
                 fn=lambda: "",
                 outputs=chat_input
+            )
+
+            chat_clear.click(
+                fn=lambda: ([], ""),
+                outputs=[
+                    chatbot,
+                    chat_input
+                ]
             )
 
         # ====================================================
@@ -1220,15 +1438,12 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info("ALPHA AI 12.0 STARTING")
+    logger.info(
+        "ALPHA AI 13.0 STARTING"
+    )
 
     app.launch(
         server_name="0.0.0.0",
         server_port=PORT,
-        show_error=False,
-        css=CSS,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="slate"
-        )
-    )
+        show_error=False
+            )
