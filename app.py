@@ -24,19 +24,9 @@ from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 16.0 - SPEED OPTIMIZED
-#
-# TEXT CHAT + IMAGE STUDIO + IMAGE ANALYSIS + VIDEO ANALYSIS
-#
-# Chat improvements:
-# - Primary model only
-# - Shorter conversation history
-# - Lower output token limits
-# - Streaming responses
-# - Local calculator
-# - Response cache
+# ALPHA AI
+# THINK BEYOND LIMITS
 # ============================================================
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ALPHA")
@@ -61,8 +51,6 @@ QUOTA_SALT = os.environ.get("ALPHA_QUOTA_SALT")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
-# Gemini models
-
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
@@ -78,19 +66,12 @@ GEMINI_BACKUP_MODEL = os.environ.get(
 # SPEED SETTINGS
 # ============================================================
 
-# Chat request timeout in milliseconds.
 CHAT_TIMEOUT = 10000
-
-# Media operations retain a longer timeout.
 API_TIMEOUT = 120000
-
-# Image generation timeout.
 IMAGE_TIMEOUT = 120
 
-# Daily image generation limit.
 DAILY_IMAGE_LIMIT = 10
 
-# Maximum video upload size.
 VIDEO_MAX_SIZE = 50 * 1024 * 1024
 
 PORT = int(os.environ.get("PORT", "10000"))
@@ -137,7 +118,6 @@ if len(QUOTA_SALT) < 32:
 
 http = requests.Session()
 
-# Dedicated fast Chat client.
 chat_gemini = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(
@@ -145,7 +125,6 @@ chat_gemini = genai.Client(
     ),
 )
 
-# Media client with longer timeout.
 gemini = genai.Client(
     api_key=GEMINI_API_KEY,
     http_options=types.HttpOptions(
@@ -188,7 +167,6 @@ def cache_get(key):
         if now - created > CACHE_TTL_SECONDS:
 
             _answer_cache.pop(key, None)
-
             return None
 
         _answer_cache.move_to_end(key)
@@ -208,7 +186,6 @@ def cache_put(key, value):
         _answer_cache.move_to_end(key)
 
         while len(_answer_cache) > CACHE_MAX_ITEMS:
-
             _answer_cache.popitem(last=False)
 
 
@@ -231,6 +208,31 @@ def cache_key(message, history):
 
 
 # ============================================================
+# MATHEMATICAL RESPONSE CLEANUP
+# ============================================================
+
+def clean_response(text):
+
+    if not isinstance(text, str):
+        return text
+
+    # Remove display-math delimiters.
+    text = text.replace("$$", "")
+
+    # Remove inline-math delimiters.
+    text = text.replace("$", "")
+
+    # Clean unnecessary whitespace.
+    text = re.sub(
+        r"[ \t]+\n",
+        "\n",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
 # COMMON HELPERS
 # ============================================================
 
@@ -246,7 +248,6 @@ def get_visitor(request):
     try:
 
         if request and request.client:
-
             ip = request.client.host or "unknown"
 
     except Exception:
@@ -383,19 +384,12 @@ STYLES = {
 RATIOS = {
 
     "1:1": (720, 720),
-
     "16:9": (1280, 720),
-
     "9:16": (720, 1280),
-
     "4:3": (960, 720),
-
     "3:4": (720, 960),
-
     "3:2": (1080, 720),
-
     "2:3": (720, 1080),
-
     "21:9": (1680, 720),
 }
 
@@ -418,25 +412,19 @@ def build_prompt(prompt, style="Automatic", extra=""):
 def generate_image(prompt):
 
     headers = {
-
         "Authorization": (
             "Bearer " + CLOUDFLARE_API_TOKEN
         ),
-
         "Content-Type": "application/json",
     }
 
     response = http.post(
-
         CLOUDFLARE_URL,
-
         headers=headers,
-
         json={
             "prompt": prompt[:2048],
             "steps": 4,
         },
-
         timeout=(10, IMAGE_TIMEOUT),
     )
 
@@ -497,13 +485,9 @@ def export_image(image_bytes, ratio="16:9"):
         ).convert("RGB")
 
         result = ImageOps.pad(
-
             image,
-
             (width, height),
-
             method=Image.Resampling.LANCZOS,
-
             color=(15, 15, 20),
         )
 
@@ -588,21 +572,13 @@ def create_image(
 FAST_OPERATORS = {
 
     ast.Add: operator.add,
-
     ast.Sub: operator.sub,
-
     ast.Mult: operator.mul,
-
     ast.Div: operator.truediv,
-
     ast.FloorDiv: operator.floordiv,
-
     ast.Mod: operator.mod,
-
     ast.Pow: operator.pow,
-
     ast.USub: operator.neg,
-
     ast.UAdd: operator.pos,
 }
 
@@ -612,7 +588,6 @@ def calculate_expression(node):
     if isinstance(node, ast.Constant):
 
         if type(node.value) in (int, float):
-
             return node.value
 
         raise ValueError("Invalid number")
@@ -624,13 +599,9 @@ def calculate_expression(node):
         )
 
         if operation is None:
-
-            raise ValueError(
-                "Unsupported operation"
-            )
+            raise ValueError("Unsupported operation")
 
         left = calculate_expression(node.left)
-
         right = calculate_expression(node.right)
 
         if isinstance(node.op, ast.Pow):
@@ -661,18 +632,13 @@ def calculate_expression(node):
         )
 
         if operation is None:
-
-            raise ValueError(
-                "Invalid operation"
-            )
+            raise ValueError("Invalid operation")
 
         return operation(
             calculate_expression(node.operand)
         )
 
-    raise ValueError(
-        "Invalid expression"
-    )
+    raise ValueError("Invalid expression")
 
 
 def fast_local_answer(message):
@@ -690,27 +656,16 @@ def fast_local_answer(message):
     replacements = {
 
         "multiplied by": "*",
-
         "multiply by": "*",
-
         "times": "*",
-
         "plus": "+",
-
         "added to": "+",
-
         "minus": "-",
-
         "subtracted by": "-",
-
         "divided by": "/",
-
         "divide by": "/",
-
         "over": "/",
-
         "modulus": "%",
-
         "mod": "%",
     }
 
@@ -723,13 +678,9 @@ def fast_local_answer(message):
         )
 
     text = (
-
         text.replace("×", "*")
-
         .replace("÷", "/")
-
         .replace("^", "**")
-
         .replace(",", "")
     )
 
@@ -758,7 +709,6 @@ def fast_local_answer(message):
         )
 
         if isinstance(answer, float):
-
             answer = round(answer, 10)
 
         return str(answer)
@@ -769,7 +719,7 @@ def fast_local_answer(message):
 
 
 # ============================================================
-# CHAT SYSTEM - SPEED OPTIMIZED
+# CHAT SYSTEM
 # ============================================================
 
 def normalize_history(history):
@@ -779,11 +729,9 @@ def normalize_history(history):
     for item in history or []:
 
         if not isinstance(item, dict):
-
             continue
 
         role = item.get("role")
-
         content = item.get("content")
 
         if (
@@ -794,17 +742,12 @@ def normalize_history(history):
             if content.strip():
 
                 result.append({
-
                     "role": role,
-
                     "content": content
                 })
 
     return result
 
-
-# Lower token limits help short responses finish sooner.
-# Detailed questions receive more room.
 
 def chat_output_limit(question):
 
@@ -813,33 +756,20 @@ def chat_output_limit(question):
     detailed = any(term in q for term in (
 
         "explain",
-
         "teach me",
-
         "step by step",
-
         "in detail",
-
         "chapter",
-
         "thermodynamics",
-
         "derive",
-
         "compare",
-
         "difference between",
-
         "why",
-
         "how does",
     ))
 
     return 400 if detailed else 150
 
-
-# Send only four previous messages.
-# This reduces the amount of context processed.
 
 def build_chat_contents(history, message):
 
@@ -854,11 +784,8 @@ def build_chat_contents(history, message):
         )
 
         contents.append(
-
             types.Content(
-
                 role=role,
-
                 parts=[
                     types.Part.from_text(
                         text=item["content"]
@@ -868,11 +795,8 @@ def build_chat_contents(history, message):
         )
 
     contents.append(
-
         types.Content(
-
             role="user",
-
             parts=[
                 types.Part.from_text(
                     text=message
@@ -897,46 +821,35 @@ def chat_reply(message, history):
     if not message or not message.strip():
 
         yield history
-
         return
 
     message = message.strip()
 
     updated = history + [
-
         {
             "role": "user",
             "content": message
         }
-
     ]
 
-    # --------------------------------------------------------
-    # 1. LOCAL CALCULATOR
-    # --------------------------------------------------------
+    # LOCAL CALCULATOR
 
     local_answer = fast_local_answer(message)
 
     if local_answer is not None:
 
-        logger.info(
-            "CHAT LOCAL CALCULATION"
-        )
+        logger.info("CHAT LOCAL CALCULATION")
 
         yield updated + [
-
             {
                 "role": "assistant",
                 "content": local_answer
             }
-
         ]
 
         return
 
-    # --------------------------------------------------------
-    # 2. CACHE
-    # --------------------------------------------------------
+    # RESPONSE CACHE
 
     key = cache_key(
         message,
@@ -947,46 +860,30 @@ def chat_reply(message, history):
 
     if cached:
 
-        logger.info(
-            "CHAT CACHE HIT"
-        )
+        logger.info("CHAT CACHE HIT")
 
         yield updated + [
-
             {
                 "role": "assistant",
-                "content": cached
+                "content": clean_response(cached)
             }
-
         ]
 
         return
 
-    # --------------------------------------------------------
-    # 3. SHOW THINKING STATUS
-    # --------------------------------------------------------
+    # THINKING STATUS
 
     yield updated + [
-
         {
             "role": "assistant",
             "content": "Thinking..."
         }
-
     ]
-
-    # --------------------------------------------------------
-    # 4. BUILD SHORT CONTEXT
-    # --------------------------------------------------------
 
     contents = build_chat_contents(
         history,
         message
     )
-
-    # --------------------------------------------------------
-    # 5. FAST GENERATION SETTINGS
-    # --------------------------------------------------------
 
     config = types.GenerateContentConfig(
 
@@ -1007,7 +904,9 @@ def chat_reply(message, history):
             "For detailed questions, provide a structured "
             "explanation without unnecessary repetition. "
 
-            "Never generate images or videos in Chat."
+            "Never generate images or videos in Chat. "
+            "Write mathematical expressions clearly. "
+            "Avoid unnecessary LaTeX dollar delimiters."
         ),
 
         temperature=0.2,
@@ -1015,12 +914,7 @@ def chat_reply(message, history):
         max_output_tokens=chat_output_limit(message),
     )
 
-    # --------------------------------------------------------
-    # 6. PRIMARY MODEL ONLY
-    # --------------------------------------------------------
-
-    # Backup model is intentionally disabled in Chat.
-    # This avoids waiting for a second model after failure.
+    # PRIMARY MODEL ONLY
 
     model_name = GEMINI_MODEL
 
@@ -1042,9 +936,7 @@ def chat_reply(message, history):
             config=config,
         )
 
-        # ----------------------------------------------------
-        # 7. STREAM RESPONSE
-        # ----------------------------------------------------
+        # STREAM RESPONSE
 
         for chunk in stream:
 
@@ -1059,21 +951,19 @@ def chat_reply(message, history):
                 full_answer += piece
 
                 yield updated + [
-
                     {
                         "role": "assistant",
-                        "content": full_answer
+                        "content": clean_response(full_answer)
                     }
-
                 ]
 
-        # ----------------------------------------------------
-        # 8. SAVE CACHE
-        # ----------------------------------------------------
+        # SAVE CACHE
 
         if full_answer.strip():
 
-            full_answer = full_answer.strip()
+            full_answer = clean_response(
+                full_answer
+            )
 
             cache_put(
                 key,
@@ -1097,15 +987,17 @@ def chat_reply(message, history):
 
     except Exception as error:
 
-        logger.exception(
-            "CHAT ERROR"
-        )
+        logger.exception("CHAT ERROR")
 
         if full_answer.strip():
 
+            full_answer = clean_response(
+                full_answer
+            )
+
             cache_put(
                 key,
-                full_answer.strip()
+                full_answer
             )
 
             return
@@ -1116,17 +1008,14 @@ def chat_reply(message, history):
         )
 
         yield updated + [
-
             {
                 "role": "assistant",
-
                 "content": (
                     "Alpha could not connect to its AI model. "
                     "Please try again. If this continues, "
                     "check Render logs and Gemini API status."
                 )
             }
-
         ]
 
 
@@ -1169,7 +1058,6 @@ def gemini_generate_media(
             answer = response.text
 
             if answer and answer.strip():
-
                 return answer.strip()
 
             raise RuntimeError(
@@ -1201,7 +1089,6 @@ def analyze_image(
 ):
 
     if not image_path:
-
         return "Please upload an image first."
 
     if not question or not question.strip():
@@ -1233,26 +1120,19 @@ def analyze_image(
             question,
 
             types.Part.from_bytes(
-
                 data=image_bytes,
-
                 mime_type="image/jpeg"
             )
         ]
 
         config = types.GenerateContentConfig(
-
             max_output_tokens=1200,
-
             temperature=0.3
         )
 
         return gemini_generate_media(
-
             contents,
-
             config,
-
             "IMAGE ANALYSIS"
         )
 
@@ -1278,7 +1158,6 @@ def generate_from_image_analysis(
 ):
 
     if not image_path or not description:
-
         return None, None
 
     analysis = analyze_image(
@@ -1290,7 +1169,6 @@ def generate_from_image_analysis(
     )
 
     if "analysis failed" in analysis.lower():
-
         return None, None
 
     prompt = (
@@ -1298,20 +1176,15 @@ def generate_from_image_analysis(
         "Create a new image based on this visual description:\n"
 
         + description
-
         + "\n"
-
         + analysis
     )
 
     try:
 
         path = create_image(
-
             prompt,
-
             request,
-
             ratio="16:9"
         )
 
@@ -1333,7 +1206,6 @@ def generate_from_image_analysis(
 def get_video_path(video):
 
     if isinstance(video, str):
-
         return video
 
     if isinstance(video, dict):
@@ -1358,7 +1230,6 @@ def analyze_video(
     video_path = get_video_path(video)
 
     if not video_path:
-
         return "Please upload a video first."
 
     uploaded = None
@@ -1366,7 +1237,6 @@ def analyze_video(
     try:
 
         if not os.path.isfile(video_path):
-
             return "Video file not found."
 
         file_size = os.path.getsize(
@@ -1380,7 +1250,6 @@ def analyze_video(
             )
 
         if file_size == 0:
-
             return "The video file is empty."
 
         uploaded = gemini.files.upload(
@@ -1406,7 +1275,6 @@ def analyze_video(
             ).upper()
 
             if state_name == "ACTIVE":
-
                 break
 
             if state_name == "FAILED":
@@ -1431,18 +1299,13 @@ def analyze_video(
             )
 
         config = types.GenerateContentConfig(
-
             max_output_tokens=1500,
-
             temperature=0.3
         )
 
         return gemini_generate_media(
-
             [uploaded, question],
-
             config,
-
             "VIDEO ANALYSIS"
         )
 
@@ -1484,7 +1347,6 @@ def generate_from_video(
 ):
 
     if not get_video_path(video):
-
         return None, None
 
     analysis = analyze_video(
@@ -1496,7 +1358,6 @@ def generate_from_video(
     )
 
     if "failed" in analysis.lower():
-
         return None, None
 
     prompt = (
@@ -1504,20 +1365,15 @@ def generate_from_video(
         "Create a new still image inspired by this video analysis:\n"
 
         + (description or "")
-
         + "\n"
-
         + analysis
     )
 
     try:
 
         path = create_image(
-
             prompt,
-
             request,
-
             ratio="16:9"
         )
 
@@ -1547,15 +1403,10 @@ def make_image(
     try:
 
         path = create_image(
-
             prompt,
-
             request,
-
             ratio,
-
             style,
-
             extra
         )
 
@@ -1621,7 +1472,7 @@ with gr.Blocks(
 
     <div id="header">
 
-        <h1>🚀 ALPHA AI 16.0</h1>
+        <h1>🚀 ALPHA AI</h1>
 
         <p>THINK BEYOND LIMITS</p>
 
@@ -1640,27 +1491,20 @@ with gr.Blocks(
         with gr.Tab("💬 Chat"):
 
             chatbot = gr.Chatbot(
-
                 label="Alpha AI",
-
                 height=500
             )
 
             chat_input = gr.Textbox(
-
                 placeholder="Ask Alpha anything...",
-
                 label="Message",
-
                 lines=2
             )
 
             with gr.Row():
 
                 chat_send = gr.Button(
-
                     "Send",
-
                     variant="primary"
                 )
 
@@ -1725,58 +1569,40 @@ with gr.Blocks(
         with gr.Tab("🎨 Image Studio"):
 
             image_prompt = gr.Textbox(
-
                 label="Image Description",
-
                 placeholder="Describe the image you want...",
-
                 lines=4
             )
 
             with gr.Row():
 
                 image_style = gr.Dropdown(
-
                     choices=list(STYLES.keys()),
-
                     value="Automatic",
-
                     label="Style"
                 )
 
                 image_ratio = gr.Dropdown(
-
                     choices=list(RATIOS.keys()),
-
                     value="16:9",
-
                     label="Aspect Ratio"
                 )
 
             image_extra = gr.Textbox(
-
                 label="Additional Instructions",
-
                 placeholder="Optional...",
-
                 lines=2
             )
 
             image_generate = gr.Button(
-
                 "🚀 Generate Image",
-
                 variant="primary"
             )
 
             studio_output = gr.Image(
-
                 label="Generated Image",
-
                 type="filepath",
-
                 interactive=False,
-
                 elem_id="result"
             )
 
@@ -1789,20 +1615,14 @@ with gr.Blocks(
                 fn=make_image,
 
                 inputs=[
-
                     image_prompt,
-
                     image_style,
-
                     image_extra,
-
                     image_ratio
                 ],
 
                 outputs=[
-
                     studio_output,
-
                     studio_download
                 ],
 
@@ -1816,34 +1636,24 @@ with gr.Blocks(
         with gr.Tab("🖼️ Image Analysis"):
 
             analysis_image = gr.Image(
-
                 label="Upload Image",
-
                 type="filepath"
             )
 
             image_question = gr.Textbox(
-
                 label="Ask About Your Image",
-
                 placeholder="What is in this image?",
-
                 lines=2
             )
 
             analyze_image_button = gr.Button(
-
                 "🔍 Analyze Image",
-
                 variant="primary"
             )
 
             image_analysis_output = gr.Textbox(
-
                 label="Analysis",
-
                 lines=8,
-
                 interactive=False
             )
 
@@ -1852,9 +1662,7 @@ with gr.Blocks(
                 fn=analyze_image,
 
                 inputs=[
-
                     analysis_image,
-
                     image_question
                 ],
 
@@ -1868,27 +1676,19 @@ with gr.Blocks(
             )
 
             image_variation_prompt = gr.Textbox(
-
                 label="Describe the New Image",
-
                 placeholder="Describe what you want to create...",
-
                 lines=2
             )
 
             image_variation_button = gr.Button(
-
                 "✨ Generate Image",
-
                 variant="primary"
             )
 
             image_variation_output = gr.Image(
-
                 label="Generated Image",
-
                 type="filepath",
-
                 interactive=False
             )
 
@@ -1901,16 +1701,12 @@ with gr.Blocks(
                 fn=generate_from_image_analysis,
 
                 inputs=[
-
                     analysis_image,
-
                     image_variation_prompt
                 ],
 
                 outputs=[
-
                     image_variation_output,
-
                     image_variation_download
                 ],
 
@@ -1924,34 +1720,24 @@ with gr.Blocks(
         with gr.Tab("🎬 Video Analysis"):
 
             video_input = gr.Video(
-
                 label="Upload Video",
-
                 sources=["upload"]
             )
 
             video_question = gr.Textbox(
-
                 label="Ask About Your Video",
-
                 placeholder="Summarize this video...",
-
                 lines=2
             )
 
             video_analyze_button = gr.Button(
-
                 "🔍 Analyze Video",
-
                 variant="primary"
             )
 
             video_analysis_output = gr.Textbox(
-
                 label="Video Analysis",
-
                 lines=9,
-
                 interactive=False
             )
 
@@ -1960,9 +1746,7 @@ with gr.Blocks(
                 fn=analyze_video,
 
                 inputs=[
-
                     video_input,
-
                     video_question
                 ],
 
@@ -1976,27 +1760,19 @@ with gr.Blocks(
             )
 
             video_image_prompt = gr.Textbox(
-
                 label="Image Description",
-
                 placeholder="Describe the scene you want to create...",
-
                 lines=2
             )
 
             video_generate_button = gr.Button(
-
                 "✨ Generate Image",
-
                 variant="primary"
             )
 
             video_image_output = gr.Image(
-
                 label="Generated Image",
-
                 type="filepath",
-
                 interactive=False
             )
 
@@ -2009,16 +1785,12 @@ with gr.Blocks(
                 fn=generate_from_video,
 
                 inputs=[
-
                     video_input,
-
                     video_image_prompt
                 ],
 
                 outputs=[
-
                     video_image_output,
-
                     video_download
                 ],
 
@@ -2031,9 +1803,7 @@ with gr.Blocks(
 # ============================================================
 
 app.queue(
-
     max_size=40,
-
     default_concurrency_limit=4
 )
 
@@ -2044,9 +1814,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info(
-        "ALPHA AI 16.0 STARTING"
-    )
+    logger.info("ALPHA AI STARTING")
 
     app.launch(
 
@@ -2057,9 +1825,7 @@ if __name__ == "__main__":
         show_error=False,
 
         theme=gr.themes.Soft(
-
             primary_hue="blue",
-
             secondary_hue="slate"
         ),
 
