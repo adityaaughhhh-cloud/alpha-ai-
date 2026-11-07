@@ -1,8 +1,7 @@
 import os
 import io
-import re
-import time
 import uuid
+import time
 import base64
 import hashlib
 import logging
@@ -16,18 +15,12 @@ import gradio as gr
 import requests
 
 from PIL import Image, ImageOps
-from google import genai
-from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 6.0
-# CHAT + IMAGE + VIDEO GENERATION
-# 10 IMAGES + 3 VIDEOS DAILY
-# 720P IMAGE AND VIDEO OUTPUT
-# SUPABASE QUOTA + STORAGE
+# ALPHA AI 7.0 - IMAGE STUDIO
+# IMAGE GENERATION ONLY
 # ============================================================
-
 
 logging.basicConfig(level=logging.INFO)
 
@@ -37,8 +30,6 @@ logger = logging.getLogger("ALPHA")
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
-
-API_KEY = os.environ.get("GEMINI_API_KEY")
 
 CLOUDFLARE_API_TOKEN = os.environ.get(
     "CLOUDFLARE_API_TOKEN"
@@ -56,54 +47,25 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
     "SUPABASE_SERVICE_ROLE_KEY"
 )
 
-SUPABASE_BUCKET = os.environ.get(
-    "SUPABASE_BUCKET", "alpha-media"
-)
-
 QUOTA_SALT = os.environ.get(
     "ALPHA_QUOTA_SALT"
 )
 
-
-CHAT_MODEL = os.environ.get(
-    "CHAT_MODEL",
-    "gemini-3.5-flash-lite"
+SUPABASE_BUCKET = os.environ.get(
+    "SUPABASE_BUCKET", "alpha-media"
 )
-
-BACKUP_MODEL = os.environ.get(
-    "BACKUP_MODEL",
-    "gemini-3.1-flash-lite"
-)
-
-VIDEO_MODEL = os.environ.get(
-    "VIDEO_MODEL",
-    "gemini-omni-1.1-flash"
-)
-
 
 DAILY_IMAGE_LIMIT = 10
-DAILY_VIDEO_LIMIT = 3
 
-
-IMAGE_TIMEOUT = 90
-VIDEO_TIMEOUT = 600
+IMAGE_TIMEOUT = 120
 
 PORT = int(
     os.environ.get("PORT", "10000")
 )
 
-
-CHAT_HISTORY_LIMIT = 8
-
 IST = ZoneInfo("Asia/Kolkata")
 
-
-LOCAL_DIR = Path(
-    os.environ.get(
-        "ALPHA_MEDIA_DIR",
-        "/tmp/alpha-media"
-    )
-)
+LOCAL_DIR = Path("/tmp/alpha-media")
 
 LOCAL_DIR.mkdir(
     parents=True,
@@ -116,8 +78,6 @@ LOCAL_DIR.mkdir(
 # ============================================================
 
 required_variables = {
-
-    "GEMINI_API_KEY": API_KEY,
 
     "CLOUDFLARE_API_TOKEN":
         CLOUDFLARE_API_TOKEN,
@@ -133,19 +93,18 @@ required_variables = {
 
     "ALPHA_QUOTA_SALT":
         QUOTA_SALT
-}
 
+}
 
 missing = [
 
-    key
+    name
 
-    for key, value in required_variables.items()
+    for name, value in required_variables.items()
 
     if not value
 
 ]
-
 
 if missing:
 
@@ -153,7 +112,6 @@ if missing:
         "Missing environment variables: "
         + ", ".join(missing)
     )
-
 
 if len(QUOTA_SALT) < 32:
 
@@ -164,111 +122,36 @@ if len(QUOTA_SALT) < 32:
 
 
 # ============================================================
-# 3. API CLIENTS
+# 3. API CONFIGURATION
 # ============================================================
 
-client = genai.Client(
-    api_key=API_KEY
-)
-
-
 http = requests.Session()
-
 
 CLOUDFLARE_IMAGE_URL = (
 
     "https://api.cloudflare.com/client/v4/accounts/"
 
-    f"{CLOUDFLARE_ACCOUNT_ID}"
+    + CLOUDFLARE_ACCOUNT_ID
 
-    "/ai/run/"
+    + "/ai/run/"
 
-    "@cf/black-forest-labs/flux-1-schnell"
+    + "@cf/black-forest-labs/flux-1-schnell"
 
 )
 
 
 # ============================================================
-# 4. SYSTEM INSTRUCTION
+# 4. DAILY DATE
 # ============================================================
 
-SYSTEM_INSTRUCTION = """
+def today():
 
-You are Alpha AI.
-
-Company: Alpha AI.
-
-Tagline: Think Beyond Limits.
-
-You are an intelligent and helpful AI assistant.
-
-Your priorities:
-
-1. Accuracy.
-2. Clear explanations.
-3. Useful answers.
-4. Logical reasoning.
-5. User safety.
-6. Honest communication.
-
-Never invent information.
-
-Admit uncertainty when necessary.
-
-Use conversation history when relevant.
-
-Explain calculations step by step when requested.
-
-Use understandable language.
-
-"""
+    return datetime.now(IST).date().isoformat()
 
 
 # ============================================================
-# 5. GENERAL HELPERS
+# 5. ERROR HANDLING
 # ============================================================
-
-def clean_text(text):
-
-    if not text:
-        return ""
-
-    text = str(text)
-
-    replacements = {
-
-        r"\times": "×",
-
-        r"\cdot": "·",
-
-        r"\div": "÷",
-
-        r"\pm": "±",
-
-        r"\neq": "≠",
-
-        r"\leq": "≤",
-
-        r"\geq": "≥",
-
-        r"\approx": "≈",
-
-        r"\pi": "π",
-
-        r"\infty": "∞",
-
-        r"\rightarrow": "→"
-
-    }
-
-    for old, new in replacements.items():
-
-        text = text.replace(old, new)
-
-    text = text.replace("$$", "").replace("$", "")
-
-    return text.strip()
-
 
 def get_error(error):
 
@@ -278,37 +161,44 @@ def get_error(error):
 
     if "429" in message or "quota" in message:
 
-        return "API quota reached. Please try later."
+        return (
+            "Cloudflare API usage limit reached. "
+            "Please try again later."
+        )
 
     if "503" in message or "overloaded" in message:
 
-        return "AI service is busy. Try again shortly."
-
-    if "403" in message:
-
-        return "API permission denied. Check API access."
+        return (
+            "Image generation service is busy. "
+            "Please try again shortly."
+        )
 
     if "401" in message:
 
-        return "API authentication failed."
+        return "Cloudflare authentication failed."
+
+    if "403" in message:
+
+        return (
+            "Cloudflare permission denied. "
+            "Check your API token."
+        )
 
     if "404" in message:
 
-        return "Requested AI model is unavailable."
+        return "Image generation model was not found."
 
     if "timeout" in message:
 
-        return "Request timed out. Please try again."
+        return (
+            "Image generation timed out. "
+            "Please try again."
+        )
 
     return (
-        "Alpha AI could not complete your request. "
+        "Alpha AI could not generate your image. "
         "Please try again."
     )
-
-
-def today():
-
-    return datetime.now(IST).date().isoformat()
 
 
 # ============================================================
@@ -325,12 +215,11 @@ def visitor_hash(request):
 
             ip = request.client.host or "unknown"
 
-        # Only use forwarded IP headers when the
-        # deployment proxy is configured to trust them.
-
     except Exception:
 
-        logger.warning("Visitor identification failed.")
+        logger.warning(
+            "Visitor identification failed."
+        )
 
     return hashlib.sha256(
 
@@ -342,7 +231,7 @@ def visitor_hash(request):
 
 
 # ============================================================
-# 7. SUPABASE HELPERS
+# 7. SUPABASE HEADERS
 # ============================================================
 
 def supabase_headers():
@@ -352,30 +241,24 @@ def supabase_headers():
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
 
         "Authorization":
-            f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
 
         "Content-Type": "application/json"
 
     }
 
 
-def consume_quota(visitor, media_type):
+# ============================================================
+# 8. CONSUME IMAGE QUOTA
+# ============================================================
+
+def consume_image_quota(visitor):
 
     endpoint = (
 
-        f"{SUPABASE_URL}/rest/v1/rpc/"
+        SUPABASE_URL
 
-        "consume_alpha_media_quota"
-
-    )
-
-    limit = (
-
-        DAILY_IMAGE_LIMIT
-
-        if media_type == "image"
-
-        else DAILY_VIDEO_LIMIT
+        + "/rest/v1/rpc/consume_alpha_media_quota"
 
     )
 
@@ -385,9 +268,9 @@ def consume_quota(visitor, media_type):
 
         "p_usage_date": today(),
 
-        "p_media_type": media_type,
+        "p_media_type": "image",
 
-        "p_daily_limit": limit
+        "p_daily_limit": DAILY_IMAGE_LIMIT
 
     }
 
@@ -399,7 +282,7 @@ def consume_quota(visitor, media_type):
 
         json=payload,
 
-        timeout=15
+        timeout=20
 
     )
 
@@ -410,19 +293,30 @@ def consume_quota(visitor, media_type):
     if not isinstance(result, dict):
 
         raise RuntimeError(
-            "Invalid quota response."
+            "Invalid Supabase quota response."
+        )
+
+    if "allowed" not in result:
+
+        raise RuntimeError(
+            "Supabase quota function returned "
+            "an unexpected response."
         )
 
     return result
 
 
-def refund_quota(visitor, media_type, usage_date):
+# ============================================================
+# 9. REFUND FAILED GENERATIONS
+# ============================================================
+
+def refund_image_quota(visitor, usage_date):
 
     endpoint = (
 
-        f"{SUPABASE_URL}/rest/v1/rpc/"
+        SUPABASE_URL
 
-        "refund_alpha_media_quota"
+        + "/rest/v1/rpc/refund_alpha_media_quota"
 
     )
 
@@ -432,7 +326,7 @@ def refund_quota(visitor, media_type, usage_date):
 
         "p_usage_date": usage_date,
 
-        "p_media_type": media_type
+        "p_media_type": "image"
 
     }
 
@@ -454,56 +348,36 @@ def refund_quota(visitor, media_type, usage_date):
 
     except Exception:
 
-        logger.exception("QUOTA REFUND FAILED")
+        logger.exception(
+            "IMAGE QUOTA REFUND FAILED"
+        )
 
 
 # ============================================================
-# 8. QUOTA DISPLAY
+# 10. IMAGE QUOTA STATUS
 # ============================================================
 
-def quota_status(visitor):
-
-    image_used = consume_quota_status(
-        visitor,
-        "image",
-        DAILY_IMAGE_LIMIT
-    )
-
-    video_used = consume_quota_status(
-        visitor,
-        "video",
-        DAILY_VIDEO_LIMIT
-    )
-
-    return f"""
-
-### Your Daily Free Allowance
-
-| Feature | Remaining |
-|---|---:|
-| Images | {image_used} / 10 |
-| Videos | {video_used} / 3 |
-
-Resets at midnight India time.
-
-"""
-
-
-def consume_quota_status(visitor, media_type, limit):
+def get_remaining_images(visitor):
 
     endpoint = (
 
-        f"{SUPABASE_URL}/rest/v1/alpha_media_usage"
+        SUPABASE_URL
 
-        f"?visitor_hash=eq.{visitor}"
-
-        f"&usage_date=eq.{today()}"
-
-        f"&media_type=eq.{media_type}"
-
-        "&select=used"
+        + "/rest/v1/alpha_media_usage"
 
     )
+
+    params = {
+
+        "visitor_hash": "eq." + visitor,
+
+        "usage_date": "eq." + today(),
+
+        "media_type": "eq.image",
+
+        "select": "used"
+
+    }
 
     response = requests.get(
 
@@ -511,7 +385,9 @@ def consume_quota_status(visitor, media_type, limit):
 
         headers=supabase_headers(),
 
-        timeout=10
+        params=params,
+
+        timeout=15
 
     )
 
@@ -521,232 +397,14 @@ def consume_quota_status(visitor, media_type, limit):
 
     used = rows[0]["used"] if rows else 0
 
-    return max(0, limit - used)
-
-
-# ============================================================
-# 9. CHAT ENGINE
-# ============================================================
-
-def prepare_history(history):
-
-    contents = []
-
-    for item in (history or [])[-CHAT_HISTORY_LIMIT:]:
-
-        if not isinstance(item, dict):
-
-            continue
-
-        role = item.get("role")
-
-        content = item.get("content")
-
-        if role not in ("user", "assistant"):
-
-            continue
-
-        if not isinstance(content, str):
-
-            continue
-
-        if not content.strip():
-
-            continue
-
-        contents.append(
-
-            types.Content(
-
-                role="user" if role == "user" else "model",
-
-                parts=[
-                    types.Part.from_text(text=content)
-                ]
-
-            )
-
-        )
-
-    return contents
-
-
-def alpha_chat(message, history):
-
-    if not message or not message.strip():
-
-        yield "Please enter a message."
-
-        return
-
-    contents = prepare_history(history)
-
-    contents.append(
-
-        types.Content(
-
-            role="user",
-
-            parts=[
-
-                types.Part.from_text(
-                    text=message.strip()
-                )
-
-            ]
-
-        )
-
+    return max(
+        0,
+        DAILY_IMAGE_LIMIT - int(used)
     )
 
-    config = types.GenerateContentConfig(
-
-        system_instruction=SYSTEM_INSTRUCTION,
-
-        temperature=0.3,
-
-        max_output_tokens=2048
-
-    )
-
-    for index, model in enumerate(
-        [CHAT_MODEL, BACKUP_MODEL]
-    ):
-
-        answer = ""
-
-        try:
-
-            stream = client.models.generate_content_stream(
-
-                model=model,
-
-                contents=contents,
-
-                config=config
-
-            )
-
-            for chunk in stream:
-
-                if chunk.text:
-
-                    answer += chunk.text
-
-                    yield clean_text(answer)
-
-            if answer:
-
-                return
-
-            yield "No response generated."
-
-            return
-
-        except Exception as error:
-
-            logger.exception(
-                "CHAT ERROR: %s",
-                model
-            )
-
-            if answer:
-
-                yield clean_text(answer)
-
-                return
-
-            if index == 1:
-
-                yield get_error(error)
-
-                return
-
 
 # ============================================================
-# 10. IMAGE CONVERSION
-# ============================================================
-
-def image_to_bytes(path, max_side=1800):
-
-    with Image.open(path) as source:
-
-        image = ImageOps.exif_transpose(
-            source
-        ).convert("RGB")
-
-        image.thumbnail(
-            (max_side, max_side)
-        )
-
-        buffer = io.BytesIO()
-
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=90
-        )
-
-        return buffer.getvalue(), "image/jpeg"
-
-
-# ============================================================
-# 11. IMAGE ANALYSIS
-# ============================================================
-
-def analyze_image(path, question):
-
-    if not path:
-
-        return "Upload an image first."
-
-    try:
-
-        data, mime = image_to_bytes(path)
-
-        response = client.models.generate_content(
-
-            model=CHAT_MODEL,
-
-            contents=[
-
-                types.Part.from_bytes(
-
-                    data=data,
-
-                    mime_type=mime
-
-                ),
-
-                types.Part.from_text(
-
-                    text=question or "Describe this image."
-
-                )
-
-            ],
-
-            config=types.GenerateContentConfig(
-
-                system_instruction=SYSTEM_INSTRUCTION,
-
-                max_output_tokens=1500
-
-            )
-
-        )
-
-        return clean_text(
-            response.text
-        )
-
-    except Exception as error:
-
-        return get_error(error)
-
-
-# ============================================================
-# 12. IMAGE GENERATION
+# 11. IMAGE STYLES
 # ============================================================
 
 STYLE_GUIDANCE = {
@@ -754,31 +412,33 @@ STYLE_GUIDANCE = {
     "Automatic": "",
 
     "Photorealistic":
-        "Photorealistic details and natural lighting.",
+        "Photorealistic appearance, realistic details, "
+        "natural lighting.",
 
     "Cinematic":
-        "Cinematic composition and dramatic lighting.",
+        "Cinematic composition, dramatic lighting, "
+        "professional film aesthetics.",
 
     "Anime":
-        "High-quality anime illustration.",
+        "High quality anime illustration.",
 
     "3D Render":
-        "Detailed professional 3D rendering.",
+        "Professional detailed 3D render.",
 
     "Digital Art":
-        "Detailed digital artwork.",
+        "Detailed professional digital artwork.",
 
     "Watercolor":
         "Traditional watercolor painting.",
 
     "Oil Painting":
-        "Detailed oil painting.",
+        "Detailed traditional oil painting.",
 
     "Pixel Art":
-        "Clean pixel art.",
+        "Detailed pixel art.",
 
     "Minimalist":
-        "Minimalist visual composition.",
+        "Clean minimalist artistic composition.",
 
     "Product Photography":
         "Professional studio product photography."
@@ -786,91 +446,8 @@ STYLE_GUIDANCE = {
 }
 
 
-def enhance_prompt(prompt, style, extra):
-
-    guidance = STYLE_GUIDANCE.get(
-        style,
-        ""
-    )
-
-    result = (
-
-        "Create one original high-quality image.\n"
-
-        "User description: "
-
-        + prompt.strip()
-
-        + "\n"
-
-        + guidance
-
-        + "\n"
-
-        + (extra or "")
-
-    )
-
-    return result[:4000]
-
-
-def generate_flux_image(prompt):
-
-    payload = {
-
-        "prompt": prompt[:2048],
-
-        "steps": 4
-
-    }
-
-    headers = {
-
-        "Authorization":
-            f"Bearer {CLOUDFLARE_API_TOKEN}",
-
-        "Content-Type":
-            "application/json"
-
-    }
-
-    response = http.post(
-
-        CLOUDFLARE_IMAGE_URL,
-
-        headers=headers,
-
-        json=payload,
-
-        timeout=(10, IMAGE_TIMEOUT)
-
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data.get("success"):
-
-        raise RuntimeError(
-            "Cloudflare image generation failed."
-        )
-
-    encoded = data.get(
-        "result", {}
-    ).get("image")
-
-    if not encoded:
-
-        raise RuntimeError(
-            "No image received."
-        )
-
-    return base64.b64decode(encoded)
-
-
 # ============================================================
-# 13. 720P IMAGE EXPORT
+# 12. IMAGE RATIOS
 # ============================================================
 
 RATIO_SIZES = {
@@ -893,6 +470,133 @@ RATIO_SIZES = {
 
 }
 
+
+# ============================================================
+# 13. PROMPT ENHANCEMENT
+# ============================================================
+
+def enhance_prompt(prompt, style, extra):
+
+    guidance = STYLE_GUIDANCE.get(
+        style,
+        ""
+    )
+
+    final_prompt = (
+
+        prompt.strip()
+
+        + "\n"
+
+        + guidance
+
+        + "\n"
+
+        + (extra or "")
+
+    )
+
+    return final_prompt[:2048]
+
+
+# ============================================================
+# 14. CLOUDFLARE IMAGE GENERATION
+# ============================================================
+
+def generate_flux_image(prompt):
+
+    headers = {
+
+        "Authorization":
+            "Bearer " + CLOUDFLARE_API_TOKEN,
+
+        "Content-Type":
+            "application/json"
+
+    }
+
+    payload = {
+
+        "prompt": prompt[:2048],
+
+        "steps": 4
+
+    }
+
+    response = http.post(
+
+        CLOUDFLARE_IMAGE_URL,
+
+        headers=headers,
+
+        json=payload,
+
+        timeout=(10, IMAGE_TIMEOUT)
+
+    )
+
+    response.raise_for_status()
+
+    content_type = response.headers.get(
+        "Content-Type", ""
+    ).lower()
+
+    # Handle JSON response.
+
+    if "application/json" in content_type:
+
+        data = response.json()
+
+        if not data.get("success", False):
+
+            errors = data.get("errors", [])
+
+            raise RuntimeError(
+                str(errors) or "Cloudflare generation failed."
+            )
+
+        encoded = data.get(
+            "result", {}
+        ).get("image")
+
+        if not encoded:
+
+            raise RuntimeError(
+                "Cloudflare returned no image."
+            )
+
+        image_bytes = base64.b64decode(
+            encoded
+        )
+
+    # Handle direct image response.
+
+    else:
+
+        image_bytes = response.content
+
+    # Validate generated image.
+
+    try:
+
+        with Image.open(
+            io.BytesIO(image_bytes)
+        ) as image:
+
+            image.verify()
+
+    except Exception:
+
+        raise RuntimeError(
+            "Cloudflare returned invalid image data."
+        )
+
+    return image_bytes
+
+
+# ============================================================
+# 15. IMAGE EXPORT
+# ============================================================
 
 def export_image(data, ratio):
 
@@ -937,30 +641,38 @@ def export_image(data, ratio):
 
 
 # ============================================================
-# 14. STORAGE
+# 16. SUPABASE STORAGE
 # ============================================================
 
-def store_media(data, filename, mime):
+def store_media(data, filename):
 
     endpoint = (
 
-        f"{SUPABASE_URL}/storage/v1/object/"
+        SUPABASE_URL
 
-        f"{SUPABASE_BUCKET}/{filename}"
+        + "/storage/v1/object/"
+
+        + SUPABASE_BUCKET
+
+        + "/"
+
+        + filename
 
     )
 
     headers = {
 
         "Authorization":
-            f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
 
         "apikey":
             SUPABASE_SERVICE_ROLE_KEY,
 
-        "Content-Type": mime,
+        "Content-Type":
+            "image/jpeg",
 
-        "x-upsert": "true"
+        "x-upsert":
+            "true"
 
     }
 
@@ -981,24 +693,24 @@ def store_media(data, filename, mime):
         response.raise_for_status()
 
         logger.info(
-            "Stored media: %s",
+            "Image stored: %s",
             filename
         )
 
     except Exception:
 
         logger.exception(
-            "MEDIA STORAGE FAILED"
+            "IMAGE STORAGE FAILED"
         )
 
 
-def background_storage(data, filename, mime):
+def background_storage(data, filename):
 
     threading.Thread(
 
         target=store_media,
 
-        args=(data, filename, mime),
+        args=(data, filename),
 
         daemon=True
 
@@ -1006,7 +718,7 @@ def background_storage(data, filename, mime):
 
 
 # ============================================================
-# 15. IMAGE GENERATION HANDLER
+# 17. MAIN IMAGE GENERATOR
 # ============================================================
 
 def make_image(
@@ -1025,11 +737,19 @@ def make_image(
 
     if not prompt or not prompt.strip():
 
-        return None, "Enter an image description.", None
+        return (
+            None,
+            "Please describe the image.",
+            None
+        )
 
     if request is None:
 
-        return None, "Visitor session unavailable.", None
+        return (
+            None,
+            "Visitor session unavailable.",
+            None
+        )
 
     visitor = visitor_hash(request)
 
@@ -1037,13 +757,14 @@ def make_image(
 
     reserved = False
 
-    start = time.monotonic()
+    started = time.monotonic()
 
     try:
 
-        quota = consume_quota(
-            visitor,
-            "image"
+        # Reserve one image credit.
+
+        quota = consume_image_quota(
+            visitor
         )
 
         if not quota.get("allowed"):
@@ -1052,7 +773,13 @@ def make_image(
 
                 None,
 
-                "Daily limit reached: 10 images.",
+                """
+                ### Daily image limit reached.
+
+                You have used all 10 free images today.
+
+                Your allowance resets at midnight India time.
+                """,
 
                 None
 
@@ -1060,7 +787,9 @@ def make_image(
 
         reserved = True
 
-        enhanced = enhance_prompt(
+        # Prepare prompt.
+
+        final_prompt = enhance_prompt(
 
             prompt,
 
@@ -1070,47 +799,77 @@ def make_image(
 
         )
 
-        raw = generate_flux_image(enhanced)
+        # Generate image.
+
+        raw_image = generate_flux_image(
+            final_prompt
+        )
+
+        # Export image.
 
         final_bytes, display = export_image(
-            raw,
+
+            raw_image,
+
             ratio
+
         )
+
+        # Save locally.
 
         image_id = uuid.uuid4().hex
 
-        output_path = LOCAL_DIR / f"{image_id}.jpg"
+        output_path = (
+            LOCAL_DIR / (image_id + ".jpg")
+        )
 
         display.save(
+
             output_path,
+
             format="JPEG",
+
             quality=94
+
         )
+
+        # Store image in Supabase.
 
         background_storage(
 
             final_bytes,
 
-            f"images/{image_id}.jpg",
-
-            "image/jpeg"
+            "images/" + image_id + ".jpg"
 
         )
 
-        elapsed = time.monotonic() - start
+        elapsed = time.monotonic() - started
 
-        remaining = quota.get("remaining", 0)
+        remaining = quota.get(
+            "remaining"
+        )
+
+        if remaining is None:
+
+            remaining = get_remaining_images(
+                visitor
+            )
 
         status = f"""
 
-### Image generated successfully!
+# Image generated successfully!
+
+**Alpha AI Image Studio**
 
 - Engine: Cloudflare FLUX.1 Schnell
 - Resolution: {display.width} × {display.height}
 - Aspect ratio: {ratio}
-- Time: {elapsed:.1f} seconds
-- Remaining images: {remaining}
-- Image ID: `{image_id}`
+- Generation time: {elapsed:.1f} seconds
+- Remaining images today: {remaining}/10
+
+Image ID: `{image_id}`
+
+Your image is ready to download.
 
 """
 
@@ -1128,396 +887,34 @@ def make_image(
 
         if reserved:
 
-            refund_quota(
+            refund_image_quota(
+
                 visitor,
-                "image",
+
                 usage_date
-            )
-
-        return None, get_error(error), None
-
-
-# ============================================================
-# 16. VIDEO GENERATION ENGINE
-# ============================================================
-
-def generate_video(
-
-    prompt,
-
-    image_path,
-
-    ratio,
-
-    request: gr.Request
-
-):
-
-    if not prompt or not prompt.strip():
-
-        return None, "Enter a video description."
-
-    if request is None:
-
-        return None, "Visitor session unavailable."
-
-    visitor = visitor_hash(request)
-
-    usage_date = today()
-
-    reserved = False
-
-    started = time.monotonic()
-
-    try:
-
-        quota = consume_quota(
-            visitor,
-            "video"
-        )
-
-        if not quota.get("allowed"):
-
-            return (
-
-                None,
-
-                "### Daily video limit reached\n"
-                "You have used all 3 free video generations."
 
             )
 
-        reserved = True
+        return (
 
-        # TEXT TO VIDEO
+            None,
 
-        if not image_path:
+            get_error(error),
 
-            video_input = (
-
-                "Create a high-quality cinematic video: "
-
-                + prompt.strip()
-
-            )
-
-            task = "text_to_video"
-
-        # IMAGE TO VIDEO
-
-        else:
-
-            image_data, mime = image_to_bytes(
-                image_path
-            )
-
-            encoded = base64.b64encode(
-                image_data
-            ).decode("utf-8")
-
-            video_input = [
-
-                {
-
-                    "type": "image",
-
-                    "data": encoded,
-
-                    "mime_type": mime
-
-                },
-
-                {
-
-                    "type": "text",
-
-                    "text": (
-                        "Animate this image into a "
-                        "cinematic video. Preserve its "
-                        "main subject and visual identity. "
-                        + prompt.strip()
-                    )
-
-                }
-
-            ]
-
-            task = "image_to_video"
-
-        # GEMINI OMNI INTERACTIONS API
-
-        interaction = client.interactions.create(
-
-            model=VIDEO_MODEL,
-
-            input=video_input,
-
-            response_format={
-
-                "type": "video",
-
-                "resolution": "720p",
-
-                "aspect_ratio": ratio
-
-            },
-
-            generation_config={
-
-                "video_config": {
-
-                    "task": task
-
-                }
-
-            }
-
-        )
-
-        video_data = getattr(
-            interaction,
-            "output_video",
             None
-        )
-
-        if not video_data or not video_data.data:
-
-            raise RuntimeError(
-                "Video generation returned no video data."
-            )
-
-        video_bytes = base64.b64decode(
-            video_data.data
-        )
-
-        video_id = uuid.uuid4().hex
-
-        output_path = LOCAL_DIR / f"{video_id}.mp4"
-
-        with open(output_path, "wb") as file:
-
-            file.write(video_bytes)
-
-        background_storage(
-
-            video_bytes,
-
-            f"videos/{video_id}.mp4",
-
-            "video/mp4"
 
         )
-
-        elapsed = time.monotonic() - started
-
-        remaining = quota.get(
-            "remaining",
-            0
-        )
-
-        status = f"""
-
-### Video generated successfully!
-
-- Engine: Gemini Omni Flash
-- Mode: {task}
-- Resolution: 720p
-- Aspect ratio: {ratio}
-- Time: {elapsed:.1f} seconds
-- Remaining videos: {remaining}
-- Video ID: `{video_id}`
-
-Your MP4 video is ready to download.
-
-"""
-
-        return str(output_path), status
-
-    except Exception as error:
-
-        logger.exception(
-            "VIDEO GENERATION FAILED"
-        )
-
-        if reserved:
-
-            refund_quota(
-
-                visitor,
-
-                "video",
-
-                usage_date
-
-            )
-
-        return None, get_error(error)
 
 
 # ============================================================
-# 17. IMAGE RESIZING
-# ============================================================
-
-def resize_image(path, scale):
-
-    if not path:
-
-        return None, "Upload an image first."
-
-    try:
-
-        factor = int(
-            scale.replace("×", "")
-        )
-
-        with Image.open(path) as source:
-
-            image = ImageOps.exif_transpose(
-                source
-            ).convert("RGB")
-
-            result = image.resize(
-
-                (
-
-                    image.width * factor,
-
-                    image.height * factor
-
-                ),
-
-                Image.Resampling.LANCZOS
-
-            )
-
-            return (
-
-                result,
-
-                f"New dimensions: "
-                f"{result.width} × {result.height}"
-
-            )
-
-    except Exception as error:
-
-        return None, get_error(error)
-
-
-# ============================================================
-# 18. VIDEO ANALYSIS
-# ============================================================
-
-def analyze_video(path, question):
-
-    if not path:
-
-        return "Upload a video first."
-
-    video_file = None
-
-    try:
-
-        video_file = client.files.upload(
-            file=path
-        )
-
-        started = time.monotonic()
-
-        while True:
-
-            video_file = client.files.get(
-                name=video_file.name
-            )
-
-            state = getattr(
-                video_file.state,
-                "name",
-                str(video_file.state)
-            ).upper()
-
-            if state == "ACTIVE":
-
-                break
-
-            if state == "FAILED":
-
-                raise RuntimeError(
-                    "Video processing failed."
-                )
-
-            if time.monotonic() - started > VIDEO_TIMEOUT:
-
-                raise TimeoutError(
-                    "Video processing timed out."
-                )
-
-            time.sleep(3)
-
-        response = client.models.generate_content(
-
-            model=CHAT_MODEL,
-
-            contents=[
-
-                types.Part.from_uri(
-
-                    file_uri=video_file.uri,
-
-                    mime_type=video_file.mime_type
-
-                ),
-
-                types.Part.from_text(
-
-                    text=question or "Describe this video."
-
-                )
-
-            ],
-
-            config=types.GenerateContentConfig(
-
-                system_instruction=SYSTEM_INSTRUCTION,
-
-                max_output_tokens=1500
-
-            )
-
-        )
-
-        return clean_text(response.text)
-
-    except Exception as error:
-
-        return get_error(error)
-
-    finally:
-
-        if video_file:
-
-            try:
-
-                client.files.delete(
-                    name=video_file.name
-                )
-
-            except Exception:
-
-                logger.warning(
-                    "Video cleanup failed."
-                )
-
-
-# ============================================================
-# 19. INTERFACE DESIGN
+# 18. USER INTERFACE
 # ============================================================
 
 CSS = """
 
 .gradio-container {
 
-    max-width: 1300px !important;
+    max-width: 1150px !important;
 
     margin: auto !important;
 
@@ -1527,21 +924,23 @@ CSS = """
 
     text-align: center;
 
-    padding: 25px;
+    padding: 30px 10px;
 
 }
 
 #alpha-header h1 {
 
-    font-size: 42px;
+    font-size: 44px;
 
     font-weight: 900;
 
-    letter-spacing: 2px;
+    letter-spacing: 3px;
 
 }
 
 #alpha-header p {
+
+    font-size: 17px;
 
     opacity: .8;
 
@@ -1563,22 +962,12 @@ textarea {
 
 
 # ============================================================
-# 20. GRADIO APPLICATION
+# 19. ALPHA AI APPLICATION
 # ============================================================
 
 with gr.Blocks(
 
-    title="ALPHA AI 6.0",
-
-    theme=gr.themes.Soft(
-
-        primary_hue="blue",
-
-        secondary_hue="slate"
-
-    ),
-
-    css=CSS
+    title="ALPHA AI 7.0 - Image Studio"
 
 ) as app:
 
@@ -1586,400 +975,142 @@ with gr.Blocks(
 
     <div id="alpha-header">
 
-        <h1>🚀 ALPHA AI 6.0</h1>
+        <h1>🚀 ALPHA AI</h1>
 
         <p>THINK BEYOND LIMITS</p>
 
-        <p>Your intelligent AI platform.</p>
+        <p>AI IMAGE STUDIO</p>
 
     </div>
 
     """)
 
-    with gr.Tabs():
+    gr.Markdown("""
 
-        # ----------------------------------------------------
-        # CHAT
-        # ----------------------------------------------------
+    ## Create images with Alpha AI
 
-        with gr.Tab("💬 Chat"):
+    Generate original images from your imagination.
 
-            gr.ChatInterface(
+    **10 free image generations per day.**
 
-                fn=alpha_chat,
+    """)
 
-                title="Alpha AI",
+    prompt = gr.Textbox(
 
-                description="Your intelligent AI assistant.",
+        label="Describe your image",
 
-                chatbot=gr.Chatbot(height=500),
+        placeholder=(
+            "Example: A beautiful futuristic city "
+            "on Mars at sunset..."
+        ),
 
-                textbox=gr.Textbox(
+        lines=5,
 
-                    placeholder="Message Alpha AI...",
+        max_lines=10
 
-                    submit_btn="Send"
+    )
 
-                )
+    with gr.Row():
 
-            )
+        style = gr.Dropdown(
 
-        # ----------------------------------------------------
-        # IMAGE GENERATOR
-        # ----------------------------------------------------
+            choices=list(STYLE_GUIDANCE.keys()),
 
-        with gr.Tab("🎨 Image Generator"):
+            value="Automatic",
 
-            gr.Markdown(
-                "## Alpha AI Image Studio"
-            )
+            label="Image style"
 
-            gr.Markdown(
-                "**10 free image generations every day.**"
-            )
+        )
 
-            prompt = gr.Textbox(
+        ratio = gr.Dropdown(
 
-                label="Image description",
+            choices=list(RATIO_SIZES.keys()),
 
-                placeholder="Describe your image...",
+            value="16:9",
 
-                lines=4
+            label="Aspect ratio"
 
-            )
+        )
 
-            with gr.Row():
+    extra = gr.Textbox(
 
-                style = gr.Dropdown(
+        label="Additional instructions",
 
-                    choices=list(STYLE_GUIDANCE.keys()),
+        placeholder="Optional instructions...",
 
-                    value="Automatic",
+        lines=2
 
-                    label="Visual style"
+    )
 
-                )
+    image_button = gr.Button(
 
-                ratio = gr.Dropdown(
+        "🚀 Generate Image",
 
-                    choices=list(RATIO_SIZES.keys()),
+        variant="primary"
 
-                    value="16:9",
+    )
 
-                    label="Aspect ratio"
+    image_output = gr.Image(
 
-                )
+        type="pil",
 
-            extra = gr.Textbox(
+        label="Your generated image"
 
-                label="Additional instructions",
+    )
 
-                lines=2
+    image_status = gr.Markdown()
 
-            )
+    image_download = gr.File(
 
-            image_button = gr.Button(
+        label="Download your image"
 
-                "🚀 Generate Image",
+    )
 
-                variant="primary"
+    image_button.click(
 
-            )
+        fn=make_image,
 
-            image_output = gr.Image(
-                type="pil",
-                label="Generated image"
-            )
+        inputs=[
 
-            image_status = gr.Markdown()
+            prompt,
 
-            image_download = gr.File(
-                label="Download image"
-            )
+            style,
 
-            image_button.click(
+            extra,
 
-                fn=make_image,
+            ratio
 
-                inputs=[
+        ],
 
-                    prompt,
+        outputs=[
 
-                    style,
+            image_output,
 
-                    extra,
+            image_status,
 
-                    ratio
+            image_download
 
-                ],
+        ],
 
-                outputs=[
+        api_name="generate_image"
 
-                    image_output,
-
-                    image_status,
-
-                    image_download
-
-                ],
-
-                api_name="generate_image"
-
-            )
-
-        # ----------------------------------------------------
-        # VIDEO GENERATOR
-        # ----------------------------------------------------
-
-        with gr.Tab("🎬 Video Generator"):
-
-            gr.Markdown(
-                "## Alpha AI Video Studio"
-            )
-
-            gr.Markdown(
-                "**3 free video generations every day.**"
-            )
-
-            video_prompt = gr.Textbox(
-
-                label="Describe your video",
-
-                placeholder=(
-                    "A cinematic shot of Saturn "
-                    "rotating in deep space..."
-                ),
-
-                lines=4
-
-            )
-
-            video_image = gr.Image(
-
-                label="Optional starting image",
-
-                type="filepath"
-
-            )
-
-            gr.Markdown(
-                "Leave the image empty for text-to-video. "
-                "Upload an image for image-to-video."
-            )
-
-            video_ratio = gr.Dropdown(
-
-                choices=["16:9", "9:16"],
-
-                value="16:9",
-
-                label="Video aspect ratio"
-
-            )
-
-            video_button = gr.Button(
-
-                "🎥 Generate 720p Video",
-
-                variant="primary"
-
-            )
-
-            video_output = gr.Video(
-
-                label="Generated video",
-
-                format="mp4"
-
-            )
-
-            video_status = gr.Markdown()
-
-            video_button.click(
-
-                fn=generate_video,
-
-                inputs=[
-
-                    video_prompt,
-
-                    video_image,
-
-                    video_ratio
-
-                ],
-
-                outputs=[
-
-                    video_output,
-
-                    video_status
-
-                ],
-
-                api_name="generate_video"
-
-            )
-
-        # ----------------------------------------------------
-        # IMAGE TOOLS
-        # ----------------------------------------------------
-
-        with gr.Tab("🛠️ Image Tools"):
-
-            resize_input = gr.Image(
-
-                type="filepath",
-
-                label="Upload image"
-
-            )
-
-            resize_scale = gr.Dropdown(
-
-                choices=["2×", "3×", "4×"],
-
-                value="2×",
-
-                label="Resize factor"
-
-            )
-
-            resize_button = gr.Button(
-                "Resize Image"
-            )
-
-            resize_output = gr.Image(
-                type="pil"
-            )
-
-            resize_status = gr.Markdown()
-
-            resize_button.click(
-
-                fn=resize_image,
-
-                inputs=[
-
-                    resize_input,
-
-                    resize_scale
-
-                ],
-
-                outputs=[
-
-                    resize_output,
-
-                    resize_status
-
-                ]
-
-            )
-
-        # ----------------------------------------------------
-        # IMAGE ANALYSIS
-        # ----------------------------------------------------
-
-        with gr.Tab("🖼️ Image Analysis"):
-
-            analysis_image = gr.Image(
-
-                type="filepath",
-
-                label="Upload image"
-
-            )
-
-            analysis_question = gr.Textbox(
-
-                label="Ask Alpha",
-
-                placeholder="What is in this image?"
-
-            )
-
-            analysis_button = gr.Button(
-                "Analyze Image"
-            )
-
-            analysis_output = gr.Markdown()
-
-            analysis_button.click(
-
-                fn=analyze_image,
-
-                inputs=[
-
-                    analysis_image,
-
-                    analysis_question
-
-                ],
-
-                outputs=analysis_output
-
-            )
-
-        # ----------------------------------------------------
-        # VIDEO ANALYSIS
-        # ----------------------------------------------------
-
-        with gr.Tab("📹 Video Analysis"):
-
-            analysis_video = gr.Video(
-
-                sources=["upload"],
-
-                label="Upload video"
-
-            )
-
-            video_question = gr.Textbox(
-
-                label="Ask Alpha",
-
-                placeholder="Explain this video."
-
-            )
-
-            analysis_button = gr.Button(
-                "Analyze Video"
-            )
-
-            analysis_output = gr.Markdown()
-
-            analysis_button.click(
-
-                fn=analyze_video,
-
-                inputs=[
-
-                    analysis_video,
-
-                    video_question
-
-                ],
-
-                outputs=analysis_output
-
-            )
+    )
 
     gr.Markdown("""
 
     ---
 
-    # ALPHA AI 6.0
+    ## ALPHA AI
 
     **THINK BEYOND LIMITS**
 
-    Powered by Google Gemini and Cloudflare FLUX.
+    Powered by Cloudflare Workers AI.
 
     """)
 
 
 # ============================================================
-# 21. QUEUE
+# 20. QUEUE
 # ============================================================
 
 app.queue(
@@ -1992,13 +1123,13 @@ app.queue(
 
 
 # ============================================================
-# 22. START APPLICATION
+# 21. START SERVER
 # ============================================================
 
 if __name__ == "__main__":
 
     logger.info(
-        "STARTING ALPHA AI 6.0"
+        "STARTING ALPHA AI 7.0 IMAGE STUDIO"
     )
 
     app.launch(
@@ -2007,6 +1138,13 @@ if __name__ == "__main__":
 
         server_port=PORT,
 
-        show_error=False
+        show_error=False,
+
+        theme=gr.themes.Soft(
+            primary_hue="blue",
+            secondary_hue="slate"
+        ),
+
+        css=CSS
 
     )
