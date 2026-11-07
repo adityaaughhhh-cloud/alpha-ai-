@@ -50,7 +50,6 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
 QUOTA_SALT = os.environ.get("ALPHA_QUOTA_SALT")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
@@ -66,13 +65,15 @@ GEMINI_BACKUP_MODEL = os.environ.get(
 # SPEED SETTINGS
 # ============================================================
 
-CHAT_TIMEOUT = 10000
+CHAT_TIMEOUT = 30000
 API_TIMEOUT = 120000
 IMAGE_TIMEOUT = 120
 
 DAILY_IMAGE_LIMIT = 10
 
 VIDEO_MAX_SIZE = 50 * 1024 * 1024
+
+CHAT_CONTINUATION_LIMIT = 2
 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -165,7 +166,6 @@ def cache_get(key):
         created, value = item
 
         if now - created > CACHE_TTL_SECONDS:
-
             _answer_cache.pop(key, None)
             return None
 
@@ -216,16 +216,182 @@ def clean_response(text):
     if not isinstance(text, str):
         return text
 
-    # Remove display-math delimiters.
     text = text.replace("$$", "")
-
-    # Remove inline-math delimiters.
     text = text.replace("$", "")
 
-    # Clean unnecessary whitespace.
+    text = text.replace(r"\(", "")
+    text = text.replace(r"\)", "")
+    text = text.replace(r"\[", "")
+    text = text.replace(r"\]", "")
+
+    # Convert common LaTeX wrappers.
+
+    for command in (
+        "text",
+        "mathrm",
+        "operatorname"
+    ):
+
+        text = re.sub(
+            r"\\" + command + r"\{([^{}]*)\}",
+            r"\1",
+            text
+        )
+
+    # Convert simple fractions.
+
+    for _ in range(5):
+
+        updated = re.sub(
+            r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}",
+            r"(\1)/(\2)",
+            text
+        )
+
+        if updated == text:
+            break
+
+        text = updated
+
+    # Convert square roots.
+
+    text = re.sub(
+        r"\\sqrt\s*\{([^{}]*)\}",
+        r"√(\1)",
+        text
+    )
+
+    # Greek letters and mathematical symbols.
+
+    symbols = {
+
+        r"\Delta": "Δ",
+        r"\delta": "δ",
+        r"\theta": "θ",
+        r"\Theta": "Θ",
+
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\Gamma": "Γ",
+
+        r"\lambda": "λ",
+        r"\Lambda": "Λ",
+
+        r"\pi": "π",
+        r"\Pi": "Π",
+
+        r"\sigma": "σ",
+        r"\Sigma": "Σ",
+
+        r"\omega": "ω",
+        r"\Omega": "Ω",
+
+        r"\mu": "μ",
+        r"\phi": "φ",
+        r"\Phi": "Φ",
+
+        r"\rho": "ρ",
+        r"\epsilon": "ε",
+        r"\varepsilon": "ε",
+
+        r"\tau": "τ",
+        r"\kappa": "κ",
+        r"\eta": "η",
+        r"\zeta": "ζ",
+
+        r"\psi": "ψ",
+        r"\Psi": "Ψ",
+
+        r"\xi": "ξ",
+        r"\Xi": "Ξ",
+        r"\chi": "χ",
+
+        r"\sum": "∑",
+        r"\prod": "∏",
+        r"\int": "∫",
+
+        r"\infty": "∞",
+
+        r"\pm": "±",
+        r"\mp": "∓",
+
+        r"\times": "×",
+        r"\cdot": "·",
+        r"\div": "÷",
+
+        r"\neq": "≠",
+        r"\ne": "≠",
+
+        r"\leq": "≤",
+        r"\le": "≤",
+
+        r"\geq": "≥",
+        r"\ge": "≥",
+
+        r"\approx": "≈",
+        r"\equiv": "≡",
+
+        r"\partial": "∂",
+        r"\nabla": "∇",
+
+        r"\propto": "∝",
+
+        r"\degree": "°",
+        r"\circ": "°",
+
+        r"\forall": "∀",
+        r"\exists": "∃",
+
+        r"\in": "∈",
+        r"\notin": "∉",
+
+        r"\subset": "⊂",
+        r"\supset": "⊃",
+
+        r"\cup": "∪",
+        r"\cap": "∩",
+
+        r"\land": "∧",
+        r"\lor": "∨",
+
+        r"\rightarrow": "→",
+        r"\to": "→",
+
+        r"\leftarrow": "←",
+        r"\Rightarrow": "⇒",
+        r"\Leftarrow": "⇐",
+
+        r"\therefore": "∴",
+        r"\because": "∵",
+    }
+
+    for command, symbol in symbols.items():
+
+        text = text.replace(
+            command,
+            symbol
+        )
+
+    # Remove unnecessary spacing commands.
+
+    text = re.sub(
+        r"\\(,|;|:|!|quad|qquad|enspace)",
+        " ",
+        text
+    )
+
+    # Clean whitespace.
+
     text = re.sub(
         r"[ \t]+\n",
         "\n",
+        text
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
         text
     )
 
@@ -526,7 +692,6 @@ def create_image(
         )
 
     visitor = get_visitor(request)
-
     usage_date = today()
 
     reserved = False
@@ -737,14 +902,13 @@ def normalize_history(history):
         if (
             role in ("user", "assistant")
             and isinstance(content, str)
+            and content.strip()
         ):
 
-            if content.strip():
-
-                result.append({
-                    "role": role,
-                    "content": content
-                })
+            result.append({
+                "role": role,
+                "content": content
+            })
 
     return result
 
@@ -768,7 +932,7 @@ def chat_output_limit(question):
         "how does",
     ))
 
-    return 400 if detailed else 150
+    return 1500 if detailed else 500
 
 
 def build_chat_contents(history, message):
@@ -806,6 +970,91 @@ def build_chat_contents(history, message):
     )
 
     return contents
+
+
+# ============================================================
+# FINISH REASON DETECTION
+# ============================================================
+
+def get_finish_reason(chunk):
+
+    candidates = getattr(
+        chunk,
+        "candidates",
+        None
+    )
+
+    if not candidates:
+        return None
+
+    candidate = candidates[0]
+
+    reason = getattr(
+        candidate,
+        "finish_reason",
+        None
+    )
+
+    if reason is None:
+        return None
+
+    return getattr(
+        reason,
+        "name",
+        str(reason)
+    ).upper()
+
+
+# ============================================================
+# CHAT STREAM HELPER
+# ============================================================
+
+def stream_chat_response(
+    contents,
+    config,
+    model_name,
+    existing_answer,
+    updated
+):
+
+    full_answer = existing_answer
+    finish_reason = None
+
+    stream = chat_gemini.models.generate_content_stream(
+        model=model_name,
+        contents=contents,
+        config=config
+    )
+
+    for chunk in stream:
+
+        reason = get_finish_reason(chunk)
+
+        if reason:
+            finish_reason = reason
+
+        piece = getattr(
+            chunk,
+            "text",
+            None
+        )
+
+        if piece:
+
+            full_answer += piece
+
+            yield (
+                full_answer,
+                finish_reason,
+                updated + [
+                    {
+                        "role": "assistant",
+                        "content": clean_response(full_answer)
+                    }
+                ]
+            )
+
+    return full_answer, finish_reason
 
 
 # ============================================================
@@ -885,6 +1134,8 @@ def chat_reply(message, history):
         message
     )
 
+    output_limit = chat_output_limit(message)
+
     config = types.GenerateContentConfig(
 
         system_instruction=(
@@ -904,28 +1155,41 @@ def chat_reply(message, history):
             "For detailed questions, provide a structured "
             "explanation without unnecessary repetition. "
 
+            "Complete your answer properly. "
+
+            "Do not stop in the middle of a sentence, "
+            "paragraph, calculation, or explanation. "
+
+            "Include a conclusion when appropriate. "
+
             "Never generate images or videos in Chat. "
+
             "Write mathematical expressions clearly. "
+
             "Avoid unnecessary LaTeX dollar delimiters."
         ),
 
         temperature=0.2,
 
-        max_output_tokens=chat_output_limit(message),
+        max_output_tokens=output_limit,
     )
-
-    # PRIMARY MODEL ONLY
 
     model_name = GEMINI_MODEL
 
     full_answer = ""
+    finish_reason = None
 
     try:
 
         logger.info(
-            "CHAT START model=%s",
-            model_name
+            "CHAT START model=%s output_limit=%s",
+            model_name,
+            output_limit
         )
+
+        # ----------------------------------------------------
+        # FIRST RESPONSE
+        # ----------------------------------------------------
 
         stream = chat_gemini.models.generate_content_stream(
 
@@ -936,9 +1200,12 @@ def chat_reply(message, history):
             config=config,
         )
 
-        # STREAM RESPONSE
-
         for chunk in stream:
+
+            reason = get_finish_reason(chunk)
+
+            if reason:
+                finish_reason = reason
 
             piece = getattr(
                 chunk,
@@ -957,7 +1224,126 @@ def chat_reply(message, history):
                     }
                 ]
 
-        # SAVE CACHE
+        logger.info(
+            "CHAT FINISH REASON: %s",
+            finish_reason
+        )
+
+        # ----------------------------------------------------
+        # CONTINUE IF TOKEN LIMIT WAS REACHED
+        # ----------------------------------------------------
+
+        continuation_count = 0
+
+        while (
+            finish_reason == "MAX_TOKENS"
+            and continuation_count < CHAT_CONTINUATION_LIMIT
+            and full_answer.strip()
+        ):
+
+            continuation_count += 1
+
+            logger.info(
+                "CHAT CONTINUATION %s",
+                continuation_count
+            )
+
+            continuation_contents = list(contents)
+
+            continuation_contents.append(
+                types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=full_answer
+                        )
+                    ]
+                )
+            )
+
+            continuation_contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "Continue exactly where your previous "
+                                "answer stopped. Do not repeat any "
+                                "previous content. Complete the "
+                                "unfinished explanation and provide "
+                                "a proper ending."
+                            )
+                        )
+                    ]
+                )
+            )
+
+            continuation_config = types.GenerateContentConfig(
+
+                system_instruction=(
+                    "Continue the previous answer naturally. "
+                    "Do not repeat previous content. "
+                    "Finish the explanation."
+                ),
+
+                temperature=0.2,
+
+                max_output_tokens=output_limit,
+            )
+
+            continuation_stream = (
+                chat_gemini.models.generate_content_stream(
+
+                    model=model_name,
+
+                    contents=continuation_contents,
+
+                    config=continuation_config
+                )
+            )
+
+            continuation_text = ""
+            new_finish_reason = None
+
+            for chunk in continuation_stream:
+
+                reason = get_finish_reason(chunk)
+
+                if reason:
+                    new_finish_reason = reason
+
+                piece = getattr(
+                    chunk,
+                    "text",
+                    None
+                )
+
+                if piece:
+
+                    continuation_text += piece
+
+                    full_answer += piece
+
+                    yield updated + [
+                        {
+                            "role": "assistant",
+                            "content": clean_response(full_answer)
+                        }
+                    ]
+
+            finish_reason = new_finish_reason
+
+            logger.info(
+                "CHAT CONTINUATION FINISH: %s",
+                finish_reason
+            )
+
+            if not continuation_text.strip():
+                break
+
+        # ----------------------------------------------------
+        # SAVE FINAL ANSWER
+        # ----------------------------------------------------
 
         if full_answer.strip():
 
@@ -975,8 +1361,9 @@ def chat_reply(message, history):
             )
 
             logger.info(
-                "CHAT COMPLETE in %.2f seconds",
-                elapsed
+                "CHAT COMPLETE in %.2f seconds | finish=%s",
+                elapsed,
+                finish_reason
             )
 
             return
@@ -989,6 +1376,8 @@ def chat_reply(message, history):
 
         logger.exception("CHAT ERROR")
 
+        # Preserve any text already received.
+
         if full_answer.strip():
 
             full_answer = clean_response(
@@ -999,6 +1388,13 @@ def chat_reply(message, history):
                 key,
                 full_answer
             )
+
+            yield updated + [
+                {
+                    "role": "assistant",
+                    "content": full_answer
+                }
+            ]
 
             return
 
@@ -1130,10 +1526,12 @@ def analyze_image(
             temperature=0.3
         )
 
-        return gemini_generate_media(
-            contents,
-            config,
-            "IMAGE ANALYSIS"
+        return clean_response(
+            gemini_generate_media(
+                contents,
+                config,
+                "IMAGE ANALYSIS"
+            )
         )
 
     except Exception:
@@ -1303,10 +1701,12 @@ def analyze_video(
             temperature=0.3
         )
 
-        return gemini_generate_media(
-            [uploaded, question],
-            config,
-            "VIDEO ANALYSIS"
+        return clean_response(
+            gemini_generate_media(
+                [uploaded, question],
+                config,
+                "VIDEO ANALYSIS"
+            )
         )
 
     except Exception:
@@ -1830,4 +2230,4 @@ if __name__ == "__main__":
         ),
 
         css=CSS
-)
+        )
