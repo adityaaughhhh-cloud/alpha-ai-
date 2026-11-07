@@ -5,6 +5,7 @@ import time
 import base64
 import hashlib
 import logging
+import mimetypes
 
 from pathlib import Path
 from datetime import datetime
@@ -14,14 +15,16 @@ import gradio as gr
 import requests
 
 from PIL import Image, ImageOps
+from google import genai
+from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 8.1 - IMAGE ONLY
+# ALPHA AI 9.0
+# CHAT + IMAGE STUDIO + IMAGE ANALYSIS + VIDEO ANALYSIS
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
-
 logger = logging.getLogger("ALPHA")
 
 
@@ -32,19 +35,23 @@ logger = logging.getLogger("ALPHA")
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
 
-SUPABASE_URL = os.environ.get(
-    "SUPABASE_URL", ""
-).rstrip("/")
-
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
-    "SUPABASE_SERVICE_ROLE_KEY"
-)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 QUOTA_SALT = os.environ.get("ALPHA_QUOTA_SALT")
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
 
 DAILY_IMAGE_LIMIT = 10
 
 IMAGE_TIMEOUT = 120
+GEMINI_TIMEOUT = 180
+VIDEO_MAX_SIZE = 50 * 1024 * 1024
 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -64,6 +71,7 @@ required = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_SERVICE_ROLE_KEY": SUPABASE_SERVICE_ROLE_KEY,
     "ALPHA_QUOTA_SALT": QUOTA_SALT,
+    "GEMINI_API_KEY": GEMINI_API_KEY,
 }
 
 missing = [
@@ -84,10 +92,14 @@ if len(QUOTA_SALT) < 32:
 
 
 # ============================================================
-# HTTP SESSION
+# API CLIENTS
 # ============================================================
 
 http = requests.Session()
+
+gemini = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 CLOUDFLARE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
@@ -167,7 +179,6 @@ def consume_image_quota(visitor):
     )
 
     if not response.ok:
-
         logger.error(
             "SUPABASE QUOTA ERROR: %s %s",
             response.status_code,
@@ -214,7 +225,6 @@ def refund_image_quota(visitor, usage_date):
         )
 
         if not response.ok:
-
             logger.error(
                 "SUPABASE REFUND ERROR: %s",
                 response.text[:1000]
@@ -223,10 +233,7 @@ def refund_image_quota(visitor, usage_date):
         response.raise_for_status()
 
     except Exception:
-
-        logger.exception(
-            "IMAGE CREDIT REFUND FAILED"
-        )
+        logger.exception("IMAGE CREDIT REFUND FAILED")
 
 
 # ============================================================
@@ -277,19 +284,12 @@ STYLES = {
 RATIOS = {
 
     "1:1": (720, 720),
-
     "16:9": (1280, 720),
-
     "9:16": (720, 1280),
-
     "4:3": (960, 720),
-
     "3:4": (720, 960),
-
     "3:2": (1080, 720),
-
     "2:3": (720, 1080),
-
     "21:9": (1680, 720)
 
 }
@@ -299,7 +299,7 @@ RATIOS = {
 # PROMPT BUILDER
 # ============================================================
 
-def build_prompt(prompt, style, extra):
+def build_prompt(prompt, style="Automatic", extra=""):
 
     style_text = STYLES.get(style, "")
 
@@ -328,7 +328,7 @@ def generate_image(prompt):
     }
 
     payload = {
-        "prompt": prompt,
+        "prompt": prompt[:2048],
         "steps": 4
     }
 
@@ -340,7 +340,6 @@ def generate_image(prompt):
     )
 
     if not response.ok:
-
         logger.error(
             "CLOUDFLARE IMAGE ERROR: %s %s",
             response.status_code,
@@ -374,13 +373,11 @@ def generate_image(prompt):
         image_bytes = base64.b64decode(encoded)
 
     else:
-
         image_bytes = response.content
 
     with Image.open(
         io.BytesIO(image_bytes)
     ) as image:
-
         image.verify()
 
     return image_bytes
@@ -390,7 +387,7 @@ def generate_image(prompt):
 # IMAGE EXPORT
 # ============================================================
 
-def export_image(image_bytes, ratio):
+def export_image(image_bytes, ratio="16:9"):
 
     width, height = RATIOS.get(
         ratio,
@@ -426,41 +423,39 @@ def export_image(image_bytes, ratio):
 
 
 # ============================================================
-# MAIN IMAGE GENERATOR
+# SHARED IMAGE GENERATION + QUOTA
 # ============================================================
 
-def make_image(
+def create_image(
     prompt,
-    style,
-    extra,
-    ratio,
-    request: gr.Request
+    request,
+    ratio="16:9",
+    style="Automatic",
+    extra=""
 ):
 
     if not prompt or not prompt.strip():
-        return None
+        raise ValueError("Please enter an image description.")
 
     if request is None:
-        return None
+        raise RuntimeError("Request information unavailable.")
 
     visitor = get_visitor(request)
-
     usage_date = today()
 
     reserved = False
 
     try:
 
-        # Reserve daily image credit.
-
         quota = consume_image_quota(visitor)
 
         if not quota.get("allowed"):
-            return None
+            raise RuntimeError(
+                "Daily image limit reached. You can create "
+                "10 images per day."
+            )
 
         reserved = True
-
-        # Build final prompt.
 
         final_prompt = build_prompt(
             prompt,
@@ -468,13 +463,9 @@ def make_image(
             extra
         )
 
-        # Generate image.
-
         image_bytes = generate_image(
             final_prompt
         )
-
-        # Export image.
 
         output_path = export_image(
             image_bytes,
@@ -485,18 +476,491 @@ def make_image(
 
     except Exception:
 
-        logger.exception(
-            "ALPHA IMAGE GENERATION FAILED"
-        )
-
         if reserved:
-
             refund_image_quota(
                 visitor,
                 usage_date
             )
 
-        return None
+        raise
+
+
+# ============================================================
+# GEMINI TEXT RESPONSE
+# ============================================================
+
+def ask_gemini(prompt):
+
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=1200
+        )
+    )
+
+    return response.text or "I could not generate a response."
+
+
+# ============================================================
+# CHAT IMAGE INTENT
+# ============================================================
+
+def wants_image(text):
+
+    value = text.lower()
+
+    keywords = [
+        "generate an image",
+        "create an image",
+        "make an image",
+        "draw an image",
+        "generate image",
+        "create image",
+        "make image",
+        "draw image",
+        "create a picture",
+        "generate a picture",
+        "make a picture",
+        "draw a picture"
+    ]
+
+    return any(
+        word in value for word in keywords
+    )
+
+
+# ============================================================
+# CHAT
+# ============================================================
+
+def chat_reply(message, history, request):
+
+    history = history or []
+
+    if not message or not message.strip():
+        return history, None, None
+
+    try:
+
+        # IMAGE GENERATION REQUEST
+
+        if wants_image(message):
+
+            image_prompt = message
+
+            image_path = create_image(
+                image_prompt,
+                request,
+                ratio="16:9"
+            )
+
+            history.append({
+                "role": "user",
+                "content": message
+            })
+
+            history.append({
+                "role": "assistant",
+                "content": "Your image has been generated."
+            })
+
+            return history, image_path, image_path
+
+        # NORMAL CHAT
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "You are Alpha AI, a helpful, "
+                            "accurate and clear AI assistant. "
+                            "Answer directly and explain "
+                            "when necessary."
+                        )
+                    )
+                ]
+            )
+        ]
+
+        # Keep recent conversation context.
+
+        for item in history[-12:]:
+
+            role = item.get("role")
+
+            content = item.get("content", "")
+
+            if not isinstance(content, str):
+                continue
+
+            if role not in ["user", "assistant"]:
+                continue
+
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[
+                        types.Part.from_text(
+                            text=content
+                        )
+                    ]
+                )
+            )
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=message
+                    )
+                ]
+            )
+        )
+
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=1200
+            )
+        )
+
+        answer = response.text or (
+            "Alpha could not generate a response."
+        )
+
+        history.append({
+            "role": "user",
+            "content": message
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        return history, None, None
+
+    except Exception:
+
+        logger.exception("CHAT ERROR")
+
+        history.append({
+            "role": "assistant",
+            "content": (
+                "Alpha is temporarily unable to answer. "
+                "Please try again."
+            )
+        })
+
+        return history, None, None
+
+
+# ============================================================
+# IMAGE ANALYSIS
+# ============================================================
+
+def analyze_image(image_path, question):
+
+    if not image_path:
+        return "Please upload an image first."
+
+    if not question or not question.strip():
+        question = (
+            "Describe this image in detail. "
+            "Explain the important objects and context."
+        )
+
+    try:
+
+        with Image.open(image_path) as image:
+
+            image = ImageOps.exif_transpose(
+                image
+            ).convert("RGB")
+
+            buffer = io.BytesIO()
+
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=90
+            )
+
+            image_bytes = buffer.getvalue()
+
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                question,
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg"
+                )
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=1200
+            )
+        )
+
+        return response.text or "No analysis returned."
+
+    except Exception:
+
+        logger.exception("IMAGE ANALYSIS ERROR")
+
+        return "Image analysis failed. Please try again."
+
+
+# ============================================================
+# GENERATE IMAGE FROM IMAGE ANALYSIS
+# ============================================================
+
+def generate_from_image_analysis(
+    image_path,
+    description,
+    request
+):
+
+    if not image_path:
+        return None, None
+
+    if not description or not description.strip():
+        return None, None
+
+    try:
+
+        analysis = analyze_image(
+            image_path,
+            description
+        )
+
+        prompt = (
+            "Create a new image inspired by this image "
+            "analysis. Do not claim it is an exact edit "
+            "of the uploaded image.\n\n"
+            + analysis
+        )
+
+        path = create_image(
+            prompt,
+            request,
+            ratio="16:9"
+        )
+
+        return path, path
+
+    except Exception:
+
+        logger.exception(
+            "IMAGE ANALYSIS GENERATION ERROR"
+        )
+
+        return None, None
+
+
+# ============================================================
+# VIDEO PATH
+# ============================================================
+
+def get_video_path(video):
+
+    if isinstance(video, str):
+        return video
+
+    if isinstance(video, dict):
+        return video.get("video")
+
+    return None
+
+
+# ============================================================
+# VIDEO ANALYSIS
+# ============================================================
+
+def analyze_video(video, question):
+
+    video_path = get_video_path(video)
+
+    if not video_path:
+        return "Please upload a video first."
+
+    try:
+
+        if os.path.getsize(video_path) > VIDEO_MAX_SIZE:
+            return (
+                "Video is too large. Please upload "
+                "a video smaller than 50 MB."
+            )
+
+        mime_type = (
+            mimetypes.guess_type(video_path)[0]
+            or "video/mp4"
+        )
+
+        uploaded = gemini.files.upload(
+            file=video_path
+        )
+
+        # Wait for Gemini video processing.
+
+        for _ in range(60):
+
+            file_info = gemini.files.get(
+                name=uploaded.name
+            )
+
+            state = str(
+                getattr(file_info, "state", "")
+            ).upper()
+
+            if "ACTIVE" in state:
+                break
+
+            if "FAILED" in state:
+                raise RuntimeError(
+                    "Gemini video processing failed."
+                )
+
+            time.sleep(2)
+
+        else:
+            raise TimeoutError(
+                "Video processing took too long."
+            )
+
+        if not question or not question.strip():
+            question = (
+                "Analyze this video. Summarize what happens, "
+                "identify important scenes and explain "
+                "the main visual content."
+            )
+
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                question,
+                uploaded
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=1500
+            )
+        )
+
+        return response.text or "No video analysis returned."
+
+    except Exception:
+
+        logger.exception("VIDEO ANALYSIS ERROR")
+
+        return (
+            "Video analysis failed. Please check the "
+            "video format and try again."
+        )
+
+    finally:
+
+        try:
+            if "uploaded" in locals():
+                gemini.files.delete(
+                    name=uploaded.name
+                )
+
+        except Exception:
+            logger.exception(
+                "GEMINI FILE CLEANUP ERROR"
+            )
+
+
+# ============================================================
+# GENERATE IMAGE FROM VIDEO ANALYSIS
+# ============================================================
+
+def generate_from_video(
+    video,
+    description,
+    request
+):
+
+    if not get_video_path(video):
+        return None, None
+
+    try:
+
+        analysis = analyze_video(
+            video,
+            description
+        )
+
+        if (
+            "analysis failed" in analysis.lower()
+            or "too large" in analysis.lower()
+            or "processing took too long" in analysis.lower()
+        ):
+            return None, None
+
+        prompt = (
+            "Create a high-quality still image inspired "
+            "by the visual scenes described below. "
+            "This is a new generated image, not an "
+            "extracted original video frame.\n\n"
+            + analysis
+        )
+
+        path = create_image(
+            prompt,
+            request,
+            ratio="16:9"
+        )
+
+        return path, path
+
+    except Exception:
+
+        logger.exception(
+            "VIDEO IMAGE GENERATION ERROR"
+        )
+
+        return None, None
+
+
+# ============================================================
+# IMAGE STUDIO CALLBACK
+# ============================================================
+
+def make_image(
+    prompt,
+    style,
+    extra,
+    ratio,
+    request
+):
+
+    try:
+
+        path = create_image(
+            prompt,
+            request,
+            ratio,
+            style,
+            extra
+        )
+
+        return path, path
+
+    except Exception:
+
+        logger.exception(
+            "IMAGE STUDIO ERROR"
+        )
+
+        return None, None
 
 
 # ============================================================
@@ -506,7 +970,7 @@ def make_image(
 CSS = """
 
 .gradio-container {
-    max-width: 1050px !important;
+    max-width: 1150px !important;
     margin: auto !important;
 }
 
@@ -543,73 +1007,306 @@ textarea {
 
 
 # ============================================================
-# ALPHA AI INTERFACE
+# INTERFACE
 # ============================================================
 
 with gr.Blocks(
-    title="ALPHA AI - Image Studio"
+    title="ALPHA AI - Think Beyond Limits"
 ) as app:
 
     gr.HTML("""
     <div id="header">
         <h1>🚀 ALPHA AI</h1>
         <p>THINK BEYOND LIMITS</p>
-        <p>IMAGE STUDIO</p>
+        <p>YOUR AI ASSISTANT</p>
     </div>
     """)
 
-    prompt = gr.Textbox(
-        label="",
-        placeholder="Describe the image you want to create...",
-        lines=4,
-        max_lines=8
-    )
+    with gr.Tabs():
 
-    with gr.Row():
+        # ====================================================
+        # CHAT
+        # ====================================================
 
-        style = gr.Dropdown(
-            choices=list(STYLES.keys()),
-            value="Automatic",
-            label="Style"
-        )
+        with gr.Tab("💬 Chat"):
 
-        ratio = gr.Dropdown(
-            choices=list(RATIOS.keys()),
-            value="16:9",
-            label="Aspect Ratio"
-        )
+            chatbot = gr.Chatbot(
+                label="Alpha AI",
+                type="messages",
+                height=480
+            )
 
-    extra = gr.Textbox(
-        label="Additional instructions",
-        placeholder="Optional...",
-        lines=2
-    )
+            chat_input = gr.Textbox(
+                placeholder=(
+                    "Ask Alpha anything or ask it to generate an image..."
+                ),
+                label="Message",
+                lines=2
+            )
 
-    generate = gr.Button(
-        "🚀 Generate Image",
-        variant="primary"
-    )
+            chat_send = gr.Button(
+                "Send",
+                variant="primary"
+            )
 
-    # FIXED FOR GRADIO 6.31
+            chat_image = gr.Image(
+                label="Generated Image",
+                type="filepath",
+                interactive=False
+            )
 
-    image_output = gr.Image(
-        label="",
-        type="filepath",
-        interactive=False,
-        elem_id="result"
-    )
+            chat_download = gr.File(
+                label="Download Generated Image"
+            )
 
-    generate.click(
-        fn=make_image,
-        inputs=[
-            prompt,
-            style,
-            extra,
-            ratio
-        ],
-        outputs=image_output,
-        api_name="generate_image"
-    )
+            chat_send.click(
+                fn=chat_reply,
+                inputs=[
+                    chat_input,
+                    chatbot
+                ],
+                outputs=[
+                    chatbot,
+                    chat_image,
+                    chat_download
+                ],
+                api_name="chat"
+            ).then(
+                fn=lambda: "",
+                outputs=chat_input
+            )
+
+            chat_input.submit(
+                fn=chat_reply,
+                inputs=[
+                    chat_input,
+                    chatbot
+                ],
+                outputs=[
+                    chatbot,
+                    chat_image,
+                    chat_download
+                ],
+                api_name="chat_submit"
+            ).then(
+                fn=lambda: "",
+                outputs=chat_input
+            )
+
+        # ====================================================
+        # IMAGE STUDIO
+        # ====================================================
+
+        with gr.Tab("🎨 Image Studio"):
+
+            image_prompt = gr.Textbox(
+                label="Image Description",
+                placeholder="Describe the image you want...",
+                lines=4
+            )
+
+            with gr.Row():
+
+                image_style = gr.Dropdown(
+                    choices=list(STYLES.keys()),
+                    value="Automatic",
+                    label="Style"
+                )
+
+                image_ratio = gr.Dropdown(
+                    choices=list(RATIOS.keys()),
+                    value="16:9",
+                    label="Aspect Ratio"
+                )
+
+            image_extra = gr.Textbox(
+                label="Additional Instructions",
+                placeholder="Optional...",
+                lines=2
+            )
+
+            image_generate = gr.Button(
+                "🚀 Generate Image",
+                variant="primary"
+            )
+
+            studio_output = gr.Image(
+                label="Generated Image",
+                type="filepath",
+                interactive=False,
+                elem_id="result"
+            )
+
+            studio_download = gr.File(
+                label="Download Image"
+            )
+
+            image_generate.click(
+                fn=make_image,
+                inputs=[
+                    image_prompt,
+                    image_style,
+                    image_extra,
+                    image_ratio
+                ],
+                outputs=[
+                    studio_output,
+                    studio_download
+                ],
+                api_name="generate_image"
+            )
+
+        # ====================================================
+        # IMAGE ANALYSIS
+        # ====================================================
+
+        with gr.Tab("🖼️ Image Analysis"):
+
+            analysis_image = gr.Image(
+                label="Upload Image",
+                type="filepath"
+            )
+
+            image_question = gr.Textbox(
+                label="Ask About Your Image",
+                placeholder="What is in this image?",
+                lines=2
+            )
+
+            analyze_image_button = gr.Button(
+                "🔍 Analyze Image",
+                variant="primary"
+            )
+
+            image_analysis_output = gr.Textbox(
+                label="Analysis",
+                lines=8,
+                interactive=False
+            )
+
+            analyze_image_button.click(
+                fn=analyze_image,
+                inputs=[
+                    analysis_image,
+                    image_question
+                ],
+                outputs=image_analysis_output,
+                api_name="analyze_image"
+            )
+
+            gr.Markdown(
+                "### Generate a New Image Inspired by Your Upload"
+            )
+
+            image_variation_prompt = gr.Textbox(
+                label="Describe the new image",
+                placeholder="Describe what you want to create...",
+                lines=2
+            )
+
+            image_variation_button = gr.Button(
+                "✨ Generate Image",
+                variant="primary"
+            )
+
+            image_variation_output = gr.Image(
+                label="Generated Image",
+                type="filepath",
+                interactive=False
+            )
+
+            image_variation_download = gr.File(
+                label="Download Image"
+            )
+
+            image_variation_button.click(
+                fn=generate_from_image_analysis,
+                inputs=[
+                    analysis_image,
+                    image_variation_prompt
+                ],
+                outputs=[
+                    image_variation_output,
+                    image_variation_download
+                ],
+                api_name="generate_from_image"
+            )
+
+        # ====================================================
+        # VIDEO ANALYSIS
+        # ====================================================
+
+        with gr.Tab("🎬 Video Analysis"):
+
+            video_input = gr.Video(
+                label="Upload Video",
+                sources=["upload"]
+            )
+
+            video_question = gr.Textbox(
+                label="Ask About Your Video",
+                placeholder="Summarize this video...",
+                lines=2
+            )
+
+            video_analyze_button = gr.Button(
+                "🔍 Analyze Video",
+                variant="primary"
+            )
+
+            video_analysis_output = gr.Textbox(
+                label="Video Analysis",
+                lines=9,
+                interactive=False
+            )
+
+            video_analyze_button.click(
+                fn=analyze_video,
+                inputs=[
+                    video_input,
+                    video_question
+                ],
+                outputs=video_analysis_output,
+                api_name="analyze_video"
+            )
+
+            gr.Markdown(
+                "### Generate an Image From Video Analysis"
+            )
+
+            video_image_prompt = gr.Textbox(
+                label="Image Description",
+                placeholder="Describe the scene you want to create...",
+                lines=2
+            )
+
+            video_generate_button = gr.Button(
+                "✨ Generate Image",
+                variant="primary"
+            )
+
+            video_image_output = gr.Image(
+                label="Generated Image",
+                type="filepath",
+                interactive=False
+            )
+
+            video_download = gr.File(
+                label="Download Image"
+            )
+
+            video_generate_button.click(
+                fn=generate_from_video,
+                inputs=[
+                    video_input,
+                    video_image_prompt
+                ],
+                outputs=[
+                    video_image_output,
+                    video_download
+                ],
+                api_name="generate_from_video"
+            )
 
 
 # ============================================================
@@ -628,9 +1325,7 @@ app.queue(
 
 if __name__ == "__main__":
 
-    logger.info(
-        "ALPHA AI 8.1 IMAGE STUDIO STARTING"
-    )
+    logger.info("ALPHA AI 9.0 STARTING")
 
     app.launch(
         server_name="0.0.0.0",
@@ -641,4 +1336,4 @@ if __name__ == "__main__":
             primary_hue="blue",
             secondary_hue="slate"
         )
-        )
+    )
