@@ -5,7 +5,6 @@ import time
 import base64
 import hashlib
 import logging
-import threading
 
 from pathlib import Path
 from datetime import datetime
@@ -18,24 +17,20 @@ from PIL import Image, ImageOps
 
 
 # ============================================================
-# ALPHA AI 8.0 - IMAGE ONLY
+# ALPHA AI 8.1 - IMAGE ONLY
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger("ALPHA")
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-CLOUDFLARE_API_TOKEN = os.environ.get(
-    "CLOUDFLARE_API_TOKEN"
-)
-
-CLOUDFLARE_ACCOUNT_ID = os.environ.get(
-    "CLOUDFLARE_ACCOUNT_ID"
-)
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
 
 SUPABASE_URL = os.environ.get(
     "SUPABASE_URL", ""
@@ -45,9 +40,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
     "SUPABASE_SERVICE_ROLE_KEY"
 )
 
-QUOTA_SALT = os.environ.get(
-    "ALPHA_QUOTA_SALT"
-)
+QUOTA_SALT = os.environ.get("ALPHA_QUOTA_SALT")
 
 DAILY_IMAGE_LIMIT = 10
 
@@ -60,8 +53,9 @@ IST = ZoneInfo("Asia/Kolkata")
 OUTPUT_DIR = Path("/tmp/alpha-images")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
 # ============================================================
-# VALIDATE ENVIRONMENT
+# ENVIRONMENT VALIDATION
 # ============================================================
 
 required = {
@@ -88,8 +82,9 @@ if len(QUOTA_SALT) < 32:
         "ALPHA_QUOTA_SALT must contain at least 32 characters."
     )
 
+
 # ============================================================
-# API CONNECTIONS
+# HTTP SESSION
 # ============================================================
 
 http = requests.Session()
@@ -99,6 +94,7 @@ CLOUDFLARE_URL = (
     + CLOUDFLARE_ACCOUNT_ID
     + "/ai/run/@cf/black-forest-labs/flux-1-schnell"
 )
+
 
 # ============================================================
 # DATE
@@ -126,7 +122,7 @@ def get_visitor(request):
     value = QUOTA_SALT + ":" + ip
 
     return hashlib.sha256(
-        value.encode()
+        value.encode("utf-8")
     ).hexdigest()
 
 
@@ -146,7 +142,7 @@ def supabase_headers():
 
 
 # ============================================================
-# RESERVE IMAGE CREDIT
+# CONSUME IMAGE CREDIT
 # ============================================================
 
 def consume_image_quota(visitor):
@@ -171,11 +167,13 @@ def consume_image_quota(visitor):
     )
 
     if not response.ok:
+
         logger.error(
             "SUPABASE QUOTA ERROR: %s %s",
             response.status_code,
             response.text[:1000]
         )
+
         response.raise_for_status()
 
     result = response.json()
@@ -216,6 +214,7 @@ def refund_image_quota(visitor, usage_date):
         )
 
         if not response.ok:
+
             logger.error(
                 "SUPABASE REFUND ERROR: %s",
                 response.text[:1000]
@@ -224,7 +223,10 @@ def refund_image_quota(visitor, usage_date):
         response.raise_for_status()
 
     except Exception:
-        logger.exception("IMAGE CREDIT REFUND FAILED")
+
+        logger.exception(
+            "IMAGE CREDIT REFUND FAILED"
+        )
 
 
 # ============================================================
@@ -236,10 +238,10 @@ STYLES = {
     "Automatic": "",
 
     "Photorealistic":
-        "Photorealistic, realistic lighting, natural details.",
+        "Photorealistic image, realistic lighting and natural details.",
 
     "Cinematic":
-        "Cinematic composition, dramatic lighting, film quality.",
+        "Cinematic composition, dramatic lighting and film quality.",
 
     "Anime":
         "High quality anime illustration.",
@@ -269,7 +271,7 @@ STYLES = {
 
 
 # ============================================================
-# IMAGE DIMENSIONS
+# IMAGE RATIOS
 # ============================================================
 
 RATIOS = {
@@ -294,7 +296,7 @@ RATIOS = {
 
 
 # ============================================================
-# PROMPT
+# PROMPT BUILDER
 # ============================================================
 
 def build_prompt(prompt, style, extra):
@@ -338,6 +340,7 @@ def generate_image(prompt):
     )
 
     if not response.ok:
+
         logger.error(
             "CLOUDFLARE IMAGE ERROR: %s %s",
             response.status_code,
@@ -423,7 +426,7 @@ def export_image(image_bytes, ratio):
 
 
 # ============================================================
-# MAIN GENERATOR
+# MAIN IMAGE GENERATOR
 # ============================================================
 
 def make_image(
@@ -448,7 +451,7 @@ def make_image(
 
     try:
 
-        # Check and reserve daily credit.
+        # Reserve daily image credit.
 
         quota = consume_image_quota(visitor)
 
@@ -457,7 +460,7 @@ def make_image(
 
         reserved = True
 
-        # Build prompt.
+        # Build final prompt.
 
         final_prompt = build_prompt(
             prompt,
@@ -465,13 +468,13 @@ def make_image(
             extra
         )
 
-        # Generate.
+        # Generate image.
 
         image_bytes = generate_image(
             final_prompt
         )
 
-        # Export.
+        # Export image.
 
         output_path = export_image(
             image_bytes,
@@ -587,11 +590,11 @@ with gr.Blocks(
         variant="primary"
     )
 
+    # FIXED FOR GRADIO 6.31
+
     image_output = gr.Image(
         label="",
         type="filepath",
-        show_download_button=True,
-        show_share_button=False,
         interactive=False,
         elem_id="result"
     )
@@ -626,7 +629,7 @@ app.queue(
 if __name__ == "__main__":
 
     logger.info(
-        "ALPHA AI 8.0 IMAGE STUDIO STARTING"
+        "ALPHA AI 8.1 IMAGE STUDIO STARTING"
     )
 
     app.launch(
@@ -638,4 +641,4 @@ if __name__ == "__main__":
             primary_hue="blue",
             secondary_hue="slate"
         )
-)
+        )
