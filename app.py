@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import uuid
 import time
 import base64
@@ -20,7 +21,7 @@ from google.genai import types
 
 
 # ============================================================
-# ALPHA AI 10.0
+# ALPHA AI 11.0
 # CHAT + IMAGE STUDIO + IMAGE ANALYSIS + VIDEO ANALYSIS
 # ============================================================
 
@@ -111,8 +112,7 @@ if missing:
 if len(QUOTA_SALT) < 32:
 
     raise RuntimeError(
-        "ALPHA_QUOTA_SALT must contain "
-        "at least 32 characters."
+        "ALPHA_QUOTA_SALT must contain at least 32 characters."
     )
 
 
@@ -240,13 +240,13 @@ def consume_image_quota(visitor):
     if not isinstance(result, dict):
 
         raise RuntimeError(
-            "Invalid quota response"
+            "Invalid quota response."
         )
 
     if "allowed" not in result:
 
         raise RuntimeError(
-            "Missing allowed field"
+            "Missing allowed field in quota response."
         )
 
     return result
@@ -366,7 +366,7 @@ RATIOS = {
 
 
 # ============================================================
-# PROMPT BUILDER
+# IMAGE PROMPT BUILDER
 # ============================================================
 
 def build_prompt(
@@ -455,7 +455,7 @@ def generate_image(prompt):
         if not data.get("success"):
 
             raise RuntimeError(
-                "Cloudflare generation failed."
+                "Cloudflare image generation failed."
             )
 
         encoded = data.get(
@@ -466,7 +466,7 @@ def generate_image(prompt):
         if not encoded:
 
             raise RuntimeError(
-                "No image returned."
+                "No image returned by Cloudflare."
             )
 
         image_bytes = base64.b64decode(
@@ -619,74 +619,266 @@ def create_image(
 
 
 # ============================================================
-# GEMINI RESPONSE
+# DYNAMIC TOKEN ALLOCATION
 # ============================================================
 
-def ask_gemini(
-    prompt
+def choose_tokens(question):
+
+    text = question.lower()
+
+    words = len(
+        text.split()
+    )
+
+    complex_topics = [
+
+        "quantum",
+
+        "relativity",
+
+        "thermodynamics",
+
+        "mechanics",
+
+        "calculus",
+
+        "derivation",
+
+        "proof",
+
+        "compare",
+
+        "difference between",
+
+        "step by step",
+
+        "detailed",
+
+        "comprehensive",
+
+        "analyze",
+
+        "explain in detail",
+
+        "research",
+
+        "advanced",
+
+        "mathematical",
+
+        "equation",
+
+        "theory"
+
+    ]
+
+    complexity = sum(
+
+        1 for topic in complex_topics
+
+        if topic in text
+
+    )
+
+    if words <= 12 and complexity == 0:
+
+        return 512
+
+    if words <= 35 and complexity <= 1:
+
+        return 1024
+
+    if words <= 80 and complexity <= 2:
+
+        return 2048
+
+    return 4096
+
+
+# ============================================================
+# GEMINI GENERATION CONFIG
+# ============================================================
+
+def get_chat_config(question):
+
+    token_limit = choose_tokens(
+        question
+    )
+
+    return types.GenerateContentConfig(
+
+        system_instruction=(
+
+            "You are Alpha AI, a highly capable and "
+            "accurate AI assistant. "
+
+            "Answer the user's actual question. "
+
+            "Use clear, simple language when appropriate. "
+
+            "For difficult topics, explain step by step. "
+
+            "Do not generate images unless the user "
+            "explicitly requests image creation. "
+
+            "Do not claim to have performed actions "
+            "that you have not performed."
+
+        ),
+
+        temperature=0.5,
+
+        max_output_tokens=token_limit
+
+    )
+
+
+# ============================================================
+# STRICT IMAGE INTENT DETECTION
+# ============================================================
+
+def wants_image(text):
+
+    if not text:
+
+        return False
+
+    value = text.lower().strip()
+
+    patterns = [
+
+        r"\b(generate|create|make|draw|design|produce)\b.{0,70}\b(image|picture|photo|illustration|artwork)\b",
+
+        r"\b(show me|give me)\b.{0,40}\b(image|picture|photo)\b",
+
+        r"\b(image|picture|photo)\s+of\s+"
+
+    ]
+
+    return any(
+
+        re.search(pattern, value)
+
+        for pattern in patterns
+
+    )
+
+
+# ============================================================
+# CHAT HISTORY NORMALIZATION
+# ============================================================
+
+def normalize_history(history):
+
+    result = []
+
+    for item in history or []:
+
+        if isinstance(item, dict):
+
+            role = item.get("role")
+
+            content = item.get("content", "")
+
+        else:
+
+            role = getattr(
+                item,
+                "role",
+                None
+            )
+
+            content = getattr(
+                item,
+                "content",
+                ""
+            )
+
+        if role not in ["user", "assistant", "model"]:
+
+            continue
+
+        if not isinstance(content, str):
+
+            continue
+
+        if not content.strip():
+
+            continue
+
+        if role == "model":
+
+            role = "assistant"
+
+        result.append({
+
+            "role": role,
+
+            "content": content
+
+        })
+
+    return result
+
+
+# ============================================================
+# CHAT CONTENT BUILDER
+# ============================================================
+
+def build_chat_contents(
+    history,
+    message
 ):
 
-    response = gemini.models.generate_content(
+    contents = []
 
-        model=GEMINI_MODEL,
+    for item in history[-12:]:
 
-        contents=prompt,
+        role = item["role"]
 
-        config=types.GenerateContentConfig(
+        content = item["content"]
 
-            temperature=0.7,
+        if role == "assistant":
 
-            max_output_tokens=1200
+            role = "model"
+
+        contents.append(
+
+            types.Content(
+
+                role=role,
+
+                parts=[
+
+                    types.Part.from_text(
+                        text=content
+                    )
+
+                ]
+
+            )
+
+        )
+
+    contents.append(
+
+        types.Content(
+
+            role="user",
+
+            parts=[
+
+                types.Part.from_text(
+                    text=message
+                )
+
+            ]
 
         )
 
     )
 
-    return response.text or (
-        "Alpha could not generate a response."
-    )
-
-
-# ============================================================
-# CHAT IMAGE DETECTION
-# ============================================================
-
-def wants_image(text):
-
-    value = text.lower()
-
-    keywords = [
-
-        "generate an image",
-
-        "create an image",
-
-        "make an image",
-
-        "draw an image",
-
-        "generate image",
-
-        "create image",
-
-        "make image",
-
-        "draw image",
-
-        "create a picture",
-
-        "generate a picture",
-
-        "make a picture",
-
-        "draw a picture"
-
-    ]
-
-    return any(
-        word in value
-        for word in keywords
-    )
+    return contents
 
 
 # ============================================================
@@ -699,19 +891,25 @@ def chat_reply(
     request: gr.Request
 ):
 
-    history = list(
-        history or []
+    history = normalize_history(
+        history
     )
 
     if not message or not message.strip():
 
-        return history, None, None
+        yield history, None, None
 
-    try:
+        return
 
-        # IMAGE GENERATION
+    message = message.strip()
 
-        if wants_image(message):
+    # --------------------------------------------------------
+    # IMAGE GENERATION ONLY WHEN EXPLICITLY REQUESTED
+    # --------------------------------------------------------
+
+    if wants_image(message):
+
+        try:
 
             image_path = create_image(
 
@@ -739,104 +937,107 @@ def chat_reply(
 
             })
 
-            return (
-                history,
-                image_path,
-                image_path
+            yield history, image_path, image_path
+
+            return
+
+        except Exception as error:
+
+            logger.exception(
+                "CHAT IMAGE GENERATION ERROR"
             )
 
-        # NORMAL CHAT
+            history.append({
 
-        contents = []
+                "role": "user",
 
-        for item in history[-12:]:
+                "content": message
 
-            if not isinstance(item, dict):
-                continue
+            })
 
-            role = item.get("role")
+            history.append({
 
-            content = item.get("content", "")
+                "role": "assistant",
 
-            if not isinstance(content, str):
-                continue
-
-            if role == "assistant":
-
-                role = "model"
-
-            if role not in ["user", "model"]:
-                continue
-
-            contents.append(
-
-                types.Content(
-
-                    role=role,
-
-                    parts=[
-
-                        types.Part.from_text(
-                            text=content
-                        )
-
-                    ]
-
+                "content": (
+                    "Image generation failed: "
+                    + str(error)[:250]
                 )
 
-            )
+            })
 
-        contents.append(
+            yield history, None, None
 
-            types.Content(
+            return
 
-                role="user",
+    # --------------------------------------------------------
+    # NORMAL TEXT CHAT
+    # --------------------------------------------------------
 
-                parts=[
+    history.append({
 
-                    types.Part.from_text(
-                        text=message
-                    )
+        "role": "user",
 
-                ]
+        "content": message
 
-            )
+    })
 
-        )
+    contents = build_chat_contents(
 
-        response = gemini.models.generate_content(
+        history[:-1],
+
+        message
+
+    )
+
+    config = get_chat_config(
+        message
+    )
+
+    answer = ""
+
+    try:
+
+        # STREAMING RESPONSE
+
+        stream = gemini.models.generate_content_stream(
 
             model=GEMINI_MODEL,
 
             contents=contents,
 
-            config=types.GenerateContentConfig(
+            config=config
 
-                system_instruction=(
-                    "You are Alpha AI, a helpful, "
-                    "accurate and clear AI assistant. "
-                    "Answer directly and explain when needed."
-                ),
+        )
 
-                temperature=0.7,
+        for chunk in stream:
 
-                max_output_tokens=1200
-
+            chunk_text = getattr(
+                chunk,
+                "text",
+                None
             )
 
-        )
+            if chunk_text:
 
-        answer = response.text or (
-            "Alpha could not generate a response."
-        )
+                answer += chunk_text
 
-        history.append({
+                temporary_history = history + [{
 
-            "role": "user",
+                    "role": "assistant",
 
-            "content": message
+                    "content": answer
 
-        })
+                }]
+
+                yield temporary_history, None, None
+
+        if not answer.strip():
+
+            answer = (
+                "Alpha could not generate a response. "
+                "Please try again."
+            )
 
         history.append({
 
@@ -846,7 +1047,7 @@ def chat_reply(
 
         })
 
-        return history, None, None
+        yield history, None, None
 
     except Exception:
 
@@ -854,7 +1055,7 @@ def chat_reply(
             "CHAT ERROR"
         )
 
-        history.append({
+        error_history = history + [{
 
             "role": "assistant",
 
@@ -863,9 +1064,9 @@ def chat_reply(
                 "Please try again."
             )
 
-        })
+        }]
 
-        return history, None, None
+        yield error_history, None, None
 
 
 # ============================================================
@@ -886,8 +1087,8 @@ def analyze_image(
     if not question or not question.strip():
 
         question = (
-            "Describe this image in detail. "
-            "Explain its important objects and context."
+            "Describe this image. Explain its "
+            "important objects and visual details."
         )
 
     try:
@@ -979,7 +1180,7 @@ def generate_from_image_analysis(
 
             "Study the uploaded image and create "
             "a detailed visual description for a "
-            "new image. The requested transformation is: "
+            "new image. Requested transformation: "
 
             + description
 
@@ -1004,7 +1205,7 @@ def generate_from_image_analysis(
 
             "Create a new high-quality image using "
             "the following visual description. "
-            "This is a text-guided generation, "
+            "This is text-guided generation, "
             "not an exact edit of the uploaded image.\n\n"
 
             + description
@@ -1049,8 +1250,11 @@ def get_video_path(video):
     if isinstance(video, dict):
 
         return (
+
             video.get("video")
+
             or video.get("path")
+
         )
 
     return None
@@ -1102,35 +1306,40 @@ def analyze_video(
                 "The uploaded video is empty."
             )
 
-        mime_type = (
-            mimetypes.guess_type(video_path)[0]
-            or "video/mp4"
-        )
-
         uploaded = gemini.files.upload(
 
             file=video_path
 
         )
 
-        # WAIT FOR VIDEO PROCESSING
+        # WAIT FOR PROCESSING
 
         for _ in range(90):
 
             uploaded = gemini.files.get(
+
                 name=uploaded.name
+
             )
 
             state = getattr(
+
                 uploaded,
+
                 "state",
+
                 None
+
             )
 
             state_name = getattr(
+
                 state,
+
                 "name",
+
                 str(state)
+
             ).upper()
 
             if state_name == "ACTIVE":
@@ -1154,9 +1363,11 @@ def analyze_video(
         if not question or not question.strip():
 
             question = (
+
                 "Analyze this video. Summarize what happens, "
                 "identify important scenes, and explain "
                 "the main visual content."
+
             )
 
         response = gemini.models.generate_content(
@@ -1201,7 +1412,9 @@ def analyze_video(
             try:
 
                 gemini.files.delete(
+
                     name=uploaded.name
+
                 )
 
             except Exception:
@@ -1233,7 +1446,10 @@ def generate_from_video(
             "important visual scenes for image creation. "
             "The user wants an image showing: "
 
-            + (description or "an important scene from the video")
+            + (
+                description
+                or "an important scene from the video"
+            )
 
         )
 
@@ -1430,7 +1646,8 @@ with gr.Blocks(
             chat_input = gr.Textbox(
 
                 placeholder=(
-                    "Ask Alpha anything or ask it to generate an image..."
+                    "Ask Alpha anything. Request an image "
+                    "only when you want one."
                 ),
 
                 label="Message",
@@ -1463,24 +1680,33 @@ with gr.Blocks(
 
             )
 
-            chat_send.click(
+            chat_event = chat_send.click(
 
                 fn=chat_reply,
 
                 inputs=[
+
                     chat_input,
+
                     chatbot
+
                 ],
 
                 outputs=[
+
                     chatbot,
+
                     chat_image,
+
                     chat_download
+
                 ],
 
                 api_name="chat"
 
-            ).then(
+            )
+
+            chat_event.then(
 
                 fn=lambda: "",
 
@@ -1488,24 +1714,33 @@ with gr.Blocks(
 
             )
 
-            chat_input.submit(
+            submit_event = chat_input.submit(
 
                 fn=chat_reply,
 
                 inputs=[
+
                     chat_input,
+
                     chatbot
+
                 ],
 
                 outputs=[
+
                     chatbot,
+
                     chat_image,
+
                     chat_download
+
                 ],
 
                 api_name="chat_submit"
 
-            ).then(
+            )
+
+            submit_event.then(
 
                 fn=lambda: "",
 
@@ -1884,7 +2119,7 @@ app.queue(
 if __name__ == "__main__":
 
     logger.info(
-        "ALPHA AI 10.0 STARTING"
+        "ALPHA AI 11.0 STARTING"
     )
 
     app.launch(
