@@ -32,6 +32,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ALPHA")
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -611,7 +612,13 @@ def create_image(
         raise
 
 
-def make_image(prompt, style, extra, ratio, request):
+def make_image(
+    prompt,
+    style,
+    extra,
+    ratio,
+    request: gr.Request = None
+):
 
     try:
 
@@ -997,11 +1004,9 @@ def analyze_image(
 
     try:
 
-        # Independent upload limit.
         reserve_quota(visitor, "image_upload")
         upload_reserved = True
 
-        # Independent analysis limit.
         reserve_quota(visitor, "image_analysis")
         analysis_reserved = True
 
@@ -1070,13 +1075,12 @@ def analyze_image(
 def generate_from_image_analysis(
     image_path,
     description,
-    request
+    request: gr.Request = None
 ):
 
     if not image_path or not description:
         raise gr.Error("Upload an image and enter a description.")
 
-    # This internal inspection does not consume analysis credits.
     with Image.open(image_path) as image:
 
         image = ImageOps.exif_transpose(
@@ -1436,7 +1440,11 @@ def translate_media_file(
                 logger.exception("TRANSLATION CLEANUP ERROR")
 
 
-def translate_audio(audio_path, target_language, request):
+def translate_audio(
+    audio_path,
+    target_language,
+    request: gr.Request = None
+):
 
     if request is None:
         raise gr.Error("Visitor information unavailable.")
@@ -1475,7 +1483,11 @@ def translate_audio(audio_path, target_language, request):
         raise gr.Error(str(error))
 
 
-def translate_video(video, target_language, request):
+def translate_video(
+    video,
+    target_language,
+    request: gr.Request = None
+):
 
     try:
 
@@ -1501,7 +1513,7 @@ def create_video(
     topic,
     duration,
     ratio,
-    request
+    request: gr.Request = None
 ):
 
     if not topic or not topic.strip():
@@ -1524,7 +1536,6 @@ def create_video(
 
         reserved = True
 
-        # Generate a structured scene plan.
         script = gemini_generate(
             (
                 "Create a visual storyboard for this video topic: "
@@ -1569,7 +1580,7 @@ def create_video(
 
         scene_files = []
 
-        for index, scene_prompt in enumerate(prompts[:3]):
+        for scene_prompt in prompts[:3]:
 
             image_bytes = generate_image_bytes(
                 scene_prompt
@@ -1582,7 +1593,6 @@ def create_video(
 
             scene_files.append(scene_path)
 
-        # FFmpeg is required on Render.
         ffmpeg = os.environ.get(
             "FFMPEG_PATH",
             "ffmpeg"
@@ -1693,13 +1703,13 @@ def create_video(
 
 
 # ============================================================
-# IMAGE VARIATION
+# IMAGE VARIATION FROM VIDEO
 # ============================================================
 
 def make_image_from_video(
     video,
     description,
-    request
+    request: gr.Request = None
 ):
 
     video_path = get_video_path(video)
@@ -1790,8 +1800,7 @@ with gr.Blocks(
 
             chatbot = gr.Chatbot(
                 label="Alpha AI",
-                height=500,
-                type="messages"
+                height=500
             )
 
             chat_input = gr.Textbox(
@@ -2200,4 +2209,4 @@ if __name__ == "__main__":
             secondary_hue="slate"
         ),
         css=CSS
-        )
+    )
