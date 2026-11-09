@@ -895,7 +895,7 @@ with gr.Blocks(title="ALPHA AI - Think Beyond Limits") as app:
 
         # CHAT
         with gr.Tab("💬 Chat"):
-            chatbot = gr.Chatbot(label="Alpha AI", height=500, type="messages")
+            chatbot = gr.Chatbot(label="Alpha AI", height=500)
             chat_input = gr.Textbox(
                 placeholder="Ask Alpha anything...", label="Message", lines=2
             )
