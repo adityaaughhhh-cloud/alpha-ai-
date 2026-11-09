@@ -1,4 +1,4 @@
-gradio
+gradio==6.31.0
 requests
 Pillow
-google-genai
+google-genai==3.0.0
