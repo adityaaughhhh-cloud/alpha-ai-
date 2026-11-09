@@ -182,12 +182,26 @@ def get_visitor(request):
         logger.exception("Could not read visitor address")
     return hashlib.sha256((QUOTA_SALT + ":" + ip).encode()).hexdigest()
 
-def supabase_headers():
-    return {
+def supabase_headers(write=False):
+    # Explicitly target the public schema for Supabase/PostgREST.
+    headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": "Bearer " + SUPABASE_SERVICE_ROLE_KEY,
         "Content-Type": "application/json",
+        "Accept-Profile": "public",
     }
+    if write:
+        headers["Content-Profile"] = "public"
+    return headers
+
+
+def raise_supabase_error(response, operation):
+    """Raise an error that includes Supabase's response body for diagnosis."""
+    if not response.ok:
+        body = (response.text or "No response body")[:1500]
+        raise RuntimeError(
+            f"{operation} failed (HTTP {response.status_code}): {body}"
+        )
 
 def reserve_quota(visitor, feature):
     limit = FREE_LIMITS[feature]
@@ -255,7 +269,8 @@ def gemini_generate(contents, config, operation):
 
 # ============================================================
 # MEMORY ENGINE
-# Memories are saved only when the user manually submits them.
+# Memory is opt-in. Explicitly stated names are saved automatically;
+# other memories are saved only when the user submits them manually.
 # ============================================================
 
 def memory_is_enabled(visitor):
@@ -269,7 +284,7 @@ def memory_is_enabled(visitor):
         },
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Read Alpha Memory setting")
     rows = response.json()
     return bool(rows and rows[0].get("enabled"))
 
@@ -277,7 +292,7 @@ def set_memory_enabled(visitor, enabled):
     response = http.post(
         MEMORY_SETTINGS_URL,
         headers={
-            **supabase_headers(),
+            **supabase_headers(write=True),
             "Prefer": "resolution=merge-duplicates,return=minimal",
         },
         params={"on_conflict": "visitor_hash"},
@@ -288,7 +303,7 @@ def set_memory_enabled(visitor, enabled):
         },
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Update Alpha Memory setting")
     return bool(enabled)
 
 def get_memories(visitor):
@@ -303,7 +318,7 @@ def get_memories(visitor):
         },
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Alpha Memory database request")
     return response.json()
 
 def save_memory(visitor, memory, category="general"):
@@ -319,7 +334,7 @@ def save_memory(visitor, memory, category="general"):
         return "That memory is already saved."
     response = http.post(
         MEMORY_URL,
-        headers={**supabase_headers(), "Prefer": "return=minimal"},
+        headers={**supabase_headers(write=True), "Prefer": "return=minimal"},
         json={
             "visitor_hash": visitor,
             "memory": memory,
@@ -327,7 +342,7 @@ def save_memory(visitor, memory, category="general"):
         },
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Alpha Memory database request")
     return "Memory saved."
 
 def delete_memory(visitor, memory_id):
@@ -340,7 +355,7 @@ def delete_memory(visitor, memory_id):
         },
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Alpha Memory database request")
     return "Memory deleted if that ID belonged to this visitor."
 
 def clear_memories(visitor):
@@ -350,8 +365,44 @@ def clear_memories(visitor):
         params={"visitor_hash": "eq." + visitor},
         timeout=15,
     )
-    response.raise_for_status()
+    raise_supabase_error(response, "Alpha Memory database request")
     return "All saved memories deleted."
+
+def auto_save_explicit_name(visitor, message):
+    """Save only a clearly stated name, and only when Memory is enabled."""
+    if not memory_is_enabled(visitor):
+        return False
+    match = re.search(
+        r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{0,39})",
+        message or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    name = re.split(r"[.!?,;\n]", match.group(1), maxsplit=1)[0].strip()
+    name = re.sub(r"\s+", " ", name)
+    if not name or len(name) > 40:
+        return False
+    existing = get_memories(visitor)
+    if any(
+        row.get("category") == "profile"
+        and str(row.get("memory", "")).casefold() == ("User's name is " + name).casefold()
+        for row in existing
+    ):
+        return False
+    response = http.post(
+        MEMORY_URL,
+        headers={**supabase_headers(write=True), "Prefer": "return=minimal"},
+        json={
+            "visitor_hash": visitor,
+            "memory": "User's name is " + name,
+            "category": "profile",
+        },
+        timeout=15,
+    )
+    raise_supabase_error(response, "Automatically save name to Alpha Memory")
+    return True
+
 
 def get_memory_context(visitor):
     if not memory_is_enabled(visitor):
@@ -614,9 +665,12 @@ def chat_reply(message, history, request: gr.Request = None):
     memory_context = ""
     if request is not None:
         try:
-            memory_context = get_memory_context(get_visitor(request))
+            visitor = get_visitor(request)
+            if memory_is_enabled(visitor):
+                auto_save_explicit_name(visitor, message)
+                memory_context = get_memory_context(visitor)
         except Exception:
-            logger.exception("Memory retrieval failed; continuing without memory.")
+            logger.exception("Memory retrieval/save failed; continuing without memory.")
 
     key = make_cache_key(message, history, memory_context)
     cached = cache_get(key)
@@ -1017,9 +1071,10 @@ with gr.Blocks(title="ALPHA AI - Think Beyond Limits") as app:
             gr.Markdown(
                 """
                 ## Alpha Memory
-                Enable memory, then manually save information you want Alpha
-                to use in future chats. Do not save passwords, OTPs or highly
-                sensitive information.
+                Enable memory to let Alpha save your clearly stated name and
+                manually save other useful details for future chats. You can
+                view or delete saved memories. Never save passwords, OTPs or
+                highly sensitive information.
                 """
             )
             memory_enabled = gr.Checkbox(
