@@ -29,10 +29,10 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
 # Primary + automatic fallback chain. All are official stable Gemini API IDs.
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash-lite").strip()
 _fallback_env = os.getenv(
     "CHAT_FALLBACK_MODELS",
-    "gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+    "gemini-3.8-flash,gemini-3.1-flash-lite"
 )
 CHAT_FALLBACK_MODELS = [
     model.strip() for model in _fallback_env.split(",") if model.strip()
@@ -42,7 +42,7 @@ IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 MAX_CHAT_HISTORY = 12
 VIDEO_PROCESSING_TIMEOUT = 120
 REQUEST_TIMEOUT = 120
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "512"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "384"))
 IMAGE_STEPS = 4  # FLUX.1 Schnell default; lower latency than higher step counts
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -262,15 +262,63 @@ EMOJI_SETS = {
 
 
 def emoji_request_reply(message):
-    """Return actual Unicode emoji when the user explicitly requests emojis."""
-    lowered = message.lower()
-    if "emoji" not in lowered and "emojis" not in lowered:
+    """Return Unicode emoji locally, without waiting for the Gemini API."""
+    lowered = message.lower().strip()
+    request_words = (
+        "emoji", "emojis", "send laughing", "smiling faces", "smiley faces",
+        "heart emojis", "animal emojis", "food emojis", "send hearts",
+        "give me hearts", "send some faces", "emoji art",
+    )
+    if not any(word in lowered for word in request_words):
         return None
-    category = next((key for key in EMOJI_SETS if key in lowered), None)
+
+    category_aliases = {
+        "faces": ("face", "faces", "smile", "smiling", "laugh", "laughing", "sad", "angry"),
+        "animals": ("animal", "animals", "dog", "cat", "bird", "fish"),
+        "nature": ("nature", "flower", "flowers", "weather", "space", "plant"),
+        "food": ("food", "fruit", "fruits", "pizza", "drink"),
+        "objects": ("object", "objects", "technology", "tech", "rocket", "sports"),
+        "symbols": ("heart", "hearts", "symbol", "symbols", "love", "check"),
+    }
+    category = next(
+        (key for key, aliases in category_aliases.items()
+         if any(alias in lowered for alias in aliases)),
+        None,
+    )
     if category:
         return EMOJI_SETS[category]
-    # Give a useful mixed set for general emoji requests; no image-generation call needed.
+    # A mixed set is returned immediately; no AI request is needed.
     return " ".join(EMOJI_SETS.values())
+
+
+# Small, reliable local answers for common factual questions. These bypass
+# network/API latency; Gemini remains responsible for questions not listed here.
+FAST_FACTS = {
+    "speed of light": (
+        "The speed of light in a vacuum is exactly 299,792,458 metres per second "
+        "(m/s), approximately 3.00 × 10⁸ m/s. ⚡"
+    ),
+    "light speed": (
+        "The speed of light in a vacuum is exactly 299,792,458 metres per second "
+        "(m/s), approximately 3.00 × 10⁸ m/s. ⚡"
+    ),
+    "value of c": (
+        "The speed of light constant, c, is exactly 299,792,458 m/s in a vacuum. ⚡"
+    ),
+}
+
+
+def quick_fact_answer(message):
+    normalized = re.sub(r"[^a-z0-9 ]", " ", (message or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return None
+    if any(phrase in normalized for phrase in (
+        "speed of light", "light speed", "value of c", "how fast does light travel",
+        "how fast is light", "how fast light travels",
+    )):
+        return FAST_FACTS["speed of light"]
+    return None
 
 
 def chat(message, image, history):
@@ -281,7 +329,12 @@ def chat(message, image, history):
 
     emoji_answer = emoji_request_reply(message) if image is None else None
     quick_answer = quick_math_answer(message) if image is None else None
-    instant_answer = emoji_answer if emoji_answer is not None else quick_answer
+    fact_answer = quick_fact_answer(message) if image is None else None
+    instant_answer = (
+        emoji_answer if emoji_answer is not None
+        else quick_answer if quick_answer is not None
+        else fact_answer
+    )
     if instant_answer is not None:
         updated = list(history)
         updated.extend([
@@ -575,4 +628,5 @@ if __name__ == "__main__":
         server_port=port,
         theme=gr.themes.Soft(),
         css=CSS,
-    )
+        )
+    
