@@ -31,6 +31,9 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
+# Optional second model. Set CHAT_FALLBACK_MODEL in Render only to a model
+# that is enabled for your Google AI API key.
+CHAT_FALLBACK_MODEL = os.getenv("CHAT_FALLBACK_MODEL", "").strip()
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 MAX_CHAT_HISTORY = 20
@@ -125,17 +128,55 @@ def transcribe_audio(audio_path):
         raise gr.Error(f"Voice transcription failed: {exc}")
 
 
+def _is_temporary_gemini_error(exc):
+    """Return True for overload, rate-limit, and temporary server errors."""
+    message = str(exc).lower()
+    markers = (
+        "503", "429", "500", "502", "504",
+        "unavailable", "high demand", "resource exhausted",
+        "deadline exceeded", "temporarily", "connection reset",
+        "timed out", "timeout",
+    )
+    return any(marker in message for marker in markers)
+
+
 def ask_gemini(contents):
+    """Call the primary Gemini model, retry transient errors, then use fallback."""
     client = require_gemini()
-    try:
-        response = client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=contents,
-        )
-        return (response.text or "").strip() or "I couldn't generate a response."
-    except Exception as exc:
-        logger.exception("Gemini request failed")
-        raise gr.Error(f"Alpha AI request failed: {exc}")
+    models = [CHAT_MODEL]
+    if CHAT_FALLBACK_MODEL and CHAT_FALLBACK_MODEL != CHAT_MODEL:
+        models.append(CHAT_FALLBACK_MODEL)
+
+    last_error = None
+    for model in models:
+        # Two attempts per model: first attempt plus one short retry.
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                )
+                return (response.text or "").strip() or "I couldn't generate a response."
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini model %s failed (attempt %s/2): %s",
+                    model, attempt + 1, exc,
+                )
+                if not _is_temporary_gemini_error(exc):
+                    # Invalid request/authentication errors will not improve by retrying.
+                    raise gr.Error(
+                        "Alpha could not process this request. Check the Gemini "
+                        "API key, model name, and request settings."
+                    )
+                if attempt == 0:
+                    time.sleep(1.5)
+
+    logger.error("All configured Gemini models failed: %s", last_error)
+    raise gr.Error(
+        "Gemini is temporarily busy. Alpha retried the request, but no "
+        "configured model is available right now. Please try again shortly."
+    )
 
 
 # ------------------------------
@@ -661,7 +702,7 @@ with gr.Blocks(title="Alpha AI") as app:
         video_voice = gr.Audio(
             sources=["microphone"],
             type="filepath",
-        label="Ask Alpha by voice",
+            label="Ask Alpha by voice",
         )
         video_transcribe_button = gr.Button("Convert voice to text")
         video_analyze_button = gr.Button("Analyze video", variant="primary")
