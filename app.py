@@ -28,8 +28,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
+# Primary + automatic fallback chain. All are official stable Gemini API IDs.
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
-CHAT_FALLBACK_MODEL = os.getenv("CHAT_FALLBACK_MODEL", "").strip()
+_fallback_env = os.getenv(
+    "CHAT_FALLBACK_MODELS",
+    "gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+)
+CHAT_FALLBACK_MODELS = [
+    model.strip() for model in _fallback_env.split(",") if model.strip()
+]
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 MAX_CHAT_HISTORY = 12
@@ -113,69 +120,83 @@ def clean_ai_text(text):
     return text.strip()
 
 
-def _is_temporary_gemini_error(exc):
+def _is_retryable_gemini_error(exc):
+    """Identify temporary overload, rate-limit, network and model-routing errors."""
     message = str(exc).lower()
-    return any(marker in message for marker in (
+    markers = (
         "503", "429", "500", "502", "504", "unavailable",
         "high demand", "resource exhausted", "deadline exceeded",
         "temporarily", "connection reset", "timed out", "timeout",
-    ))
+        "model not found", "not found", "unknown model",
+        "is not supported", "unsupported model",
+    )
+    return any(marker in message for marker in markers)
 
 
 def ask_gemini(contents):
-    """Use a concise output budget and a configured fallback if needed."""
+    """Try the primary model and stable fallbacks instead of stopping on one 503."""
     client = require_gemini()
-    models = [CHAT_MODEL]
-    if CHAT_FALLBACK_MODEL and CHAT_FALLBACK_MODEL != CHAT_MODEL:
-        models.append(CHAT_FALLBACK_MODEL)
+    models = []
+    for model in [CHAT_MODEL, *CHAT_FALLBACK_MODELS]:
+        if model and model not in models:
+            models.append(model)
 
     last_error = None
-    for model in models:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                    temperature=0.4,
-                    system_instruction=(
-                        "You are Alpha AI, a helpful, accurate, friendly assistant. "
-                        "Your tagline is Think Beyond Limits. Understand the user's "
-                        "actual intention and answer the request, not just a related topic. "
-                        "Be conversational, clear, and concise unless the user asks for detail. "
-                        "EMOJI SUPPORT: You can understand and use the full Unicode emoji "
-                        "standard supported by the model and the user's device. This includes "
-                        "smileys, emotions, people, gestures, skin-tone variants, animals, "
-                        "nature, food, drinks, travel, places, activities, sports, objects, "
-                        "symbols, hearts, flags, family and gender combinations, science, "
-                        "technology, education, business, space, weather, and celebrations. "
-                        "Use relevant emojis naturally when they improve readability or tone. "
-                        "Do not force emojis into every sentence, and respect a user's request "
-                        "for no emojis. Do not replace an emoji with its written name when "
-                        "the actual character can be used. Preserve emoji sequences and "
-                        "Unicode characters in the response. Actual appearance depends on "
-                        "the user's device, browser, and font support. "
-                        "Use readable Unicode symbols in equations, such as CO₂ and H₂O. "
-                        "Do not wrap equations or variables in LaTeX dollar signs. "
-                        "Show calculation steps when useful."
+    for model_index, model in enumerate(models):
+        # A single short retry for transient overload; then move to the next model.
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        temperature=0.4,
+                        system_instruction=(
+                            "You are Alpha, a helpful and accurate assistant. "
+                            "Answer the user's actual request directly. If they ask "
+                            "for a study routine, give a usable routine and explain "
+                            "the key choices briefly, not just a bare timetable. "
+                            "Be concise unless more detail is requested. Use readable "
+                            "Unicode symbols such as CO₂ and H₂O; do not use raw "
+                            "LaTeX dollar delimiters. Show calculation steps when useful."
+                        ),
                     ),
-                ),
-            )
-            return clean_ai_text(response.text or "") or (
-                "I couldn't generate a response. Please try again."
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Gemini model %s failed: %s", model, exc)
-            if not _is_temporary_gemini_error(exc):
-                raise gr.Error(
-                    "Alpha could not process this request. Check the Gemini "
-                    "API key and CHAT_MODEL setting in Render."
                 )
+                answer = clean_ai_text(getattr(response, "text", "") or "")
+                if answer:
+                    logger.info("Chat answered using model %s", model)
+                    return answer
+                raise RuntimeError(f"Gemini model {model} returned an empty response")
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Gemini model %s attempt %s/%s failed: %s",
+                    model, attempt + 1, 2, exc
+                )
+                if not _is_retryable_gemini_error(exc):
+                    # Invalid model IDs and temporary provider failures can be routed
+                    # to another model; authentication/configuration errors cannot.
+                    msg = str(exc).lower()
+                    if not any(x in msg for x in (
+                        "model not found", "not found", "unknown model",
+                        "unsupported model", "is not supported",
+                    )):
+                        raise gr.Error(
+                            "Alpha could not reach Gemini. Check that GEMINI_API_KEY "
+                            "is valid and that the Gemini API is enabled for this key."
+                        )
+                    break
+                if attempt == 0:
+                    time.sleep(0.6)
+                else:
+                    break
 
-    logger.error("All configured Gemini models failed: %s", last_error)
+    logger.error("Every configured Gemini chat model failed: %s", last_error)
     raise gr.Error(
-        "Gemini is temporarily busy. Please try again shortly."
+        "Alpha's AI providers are temporarily unavailable or busy. "
+        "Please retry in a moment. If this keeps happening, check the Gemini "
+        "API quota, billing status, and Render logs."
     )
 
 
