@@ -4,6 +4,9 @@ import time
 import mimetypes
 import tempfile
 import logging
+import ast
+import operator
+import re
 from pathlib import Path
 
 import gradio as gr
@@ -139,12 +142,67 @@ def ask_gemini(contents):
 # Chat and voice chat
 # ------------------------------
 
+# Fast local calculator: simple arithmetic is answered without waiting for Gemini.
+_MATH_OPERATORS = {
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos,
+}
+
+def _safe_math(node):
+    if isinstance(node, ast.Expression):
+        return _safe_math(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _MATH_OPERATORS:
+        left, right = _safe_math(node.left), _safe_math(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > 8:
+            raise ValueError("Exponent too large")
+        result = _MATH_OPERATORS[type(node.op)](left, right)
+        if abs(result) > 10**15:
+            raise ValueError("Result too large")
+        return result
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _MATH_OPERATORS:
+        return _MATH_OPERATORS[type(node.op)](_safe_math(node.operand))
+    raise ValueError("Unsupported expression")
+
+def quick_math_answer(message):
+    text = message.lower().replace(",", "")
+    text = re.sub(r"\b(what is|what's|calculate|compute|solve|answer|please)\b", " ", text)
+    text = text.replace("×", "*").replace("÷", "/").replace("−", "-")
+    text = re.sub(r"\b(plus)\b", "+", text)
+    text = re.sub(r"\b(minus)\b", "-", text)
+    text = re.sub(r"\b(times|multiplied by)\b", "*", text)
+    text = re.sub(r"\b(divided by)\b", "/", text)
+    text = text.strip().rstrip("?= ")
+    if not re.fullmatch(r"[0-9.()+*/%\-\s]+", text) or not re.search(r"[+*/%\-]", text):
+        return None
+    try:
+        value = _safe_math(ast.parse(text, mode="eval"))
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        return str(value)
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError, SyntaxError):
+        return None
+
+
 def chat(message, history):
     message = (message or "").strip()
     history = history or []
 
     if not message:
         return history, None, None
+
+    # Handle basic arithmetic locally so it does not incur an AI API round-trip.
+    quick_answer = quick_math_answer(message)
+    if quick_answer is not None:
+        new_history = list(history)
+        new_history.extend([
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": quick_answer},
+        ])
+        return new_history, None, None
 
     conversation = []
     for item in history[-MAX_CHAT_HISTORY:]:
@@ -602,7 +660,7 @@ with gr.Blocks(title="Alpha AI") as app:
         )
         video_voice = gr.Audio(
             sources=["microphone"],
-            type="filepath",
+            type="filep    
             label="Ask Alpha by voice",
         )
         video_transcribe_button = gr.Button("Convert voice to text")
@@ -637,5 +695,5 @@ if __name__ == "__main__":
         server_port=port,
         theme=gr.themes.Soft(),
         css=CSS,
-        )
-    
+    )
+        
