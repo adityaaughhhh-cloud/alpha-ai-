@@ -43,6 +43,7 @@ MAX_CHAT_HISTORY = 12
 VIDEO_PROCESSING_TIMEOUT = 120
 REQUEST_TIMEOUT = 120
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "512"))
+IMAGE_STEPS = 4  # FLUX.1 Schnell default; lower latency than higher step counts
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -143,8 +144,8 @@ def ask_gemini(contents):
 
     last_error = None
     for model_index, model in enumerate(models):
-        # A single short retry for transient overload; then move to the next model.
-        for attempt in range(2):
+        # Try each configured model once to avoid wasting time on repeated retries.
+        for attempt in range(1):
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -153,12 +154,15 @@ def ask_gemini(contents):
                         max_output_tokens=MAX_OUTPUT_TOKENS,
                         temperature=0.4,
                         system_instruction=(
-                            "You are Alpha, a helpful and accurate assistant. "
+                            "You are Alpha, a fast, helpful and accurate assistant. "
                             "Answer the user's actual request directly. If they ask "
                             "for a study routine, give a usable routine and explain "
                             "the key choices briefly, not just a bare timetable. "
-                            "Be concise unless more detail is requested. Use readable "
-                            "Unicode symbols such as CO₂ and H₂O; do not use raw "
+                            "Use relevant Unicode emojis naturally in normal replies. "
+                            "If the user asks for emojis or emoji art, output the requested "
+                            "emojis clearly, not a description of them. Do not replace "
+                            "emojis with words. Be concise unless more detail is requested. "
+                            "Use readable Unicode symbols such as CO₂ and H₂O; do not use raw "
                             "LaTeX dollar delimiters. Show calculation steps when useful."
                         ),
                     ),
@@ -172,7 +176,7 @@ def ask_gemini(contents):
                 last_error = exc
                 logger.warning(
                     "Gemini model %s attempt %s/%s failed: %s",
-                    model, attempt + 1, 2, exc
+                    model, attempt + 1, 1, exc
                 )
                 if not _is_retryable_gemini_error(exc):
                     # Invalid model IDs and temporary provider failures can be routed
@@ -187,10 +191,7 @@ def ask_gemini(contents):
                             "is valid and that the Gemini API is enabled for this key."
                         )
                     break
-                if attempt == 0:
-                    time.sleep(0.6)
-                else:
-                    break
+                break
 
     logger.error("Every configured Gemini chat model failed: %s", last_error)
     raise gr.Error(
@@ -250,18 +251,42 @@ def quick_math_answer(message):
         return None
 
 
-def chat(message, history):
+EMOJI_SETS = {
+    "faces": "😀 😃 😄 😁 😆 😅 😂 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😎 🤔 🤗 🥳 😴 😭 😡 🤯 🫡",
+    "animals": "🐶 🐱 🐭 🐹 🐰 🦊 🐻 🐼 🐨 🐯 🦁 🐮 🐸 🐵 🐧 🐦 🦋 🐢 🐬 🐳 🦄 🦖",
+    "nature": "🌸 🌺 🌻 🌼 🌷 🌹 🪻 🌳 🌴 🍀 🌈 ☀️ 🌤️ 🌙 ⭐ 🌟 ⚡ 🔥 ❄️ 🌊",
+    "food": "🍎 🍓 🍒 🍉 🍍 🥭 🍌 🍕 🍔 🍟 🌮 🍿 🍩 🍪 🎂 🍫 🍦 ☕ 🧃",
+    "objects": "📱 💻 🎧 📷 💡 🔑 🎁 🎈 🎨 🚀 🛰️ ⚽ 🏆 🎮 📚 ✏️ 🔬 🔭",
+    "symbols": "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💯 ✅ ❌ ⭐ ✨ ➡️ ⬆️ 🔔 ♻️ ™️ ®️",
+}
+
+
+def emoji_request_reply(message):
+    """Return actual Unicode emoji when the user explicitly requests emojis."""
+    lowered = message.lower()
+    if "emoji" not in lowered and "emojis" not in lowered:
+        return None
+    category = next((key for key in EMOJI_SETS if key in lowered), None)
+    if category:
+        return EMOJI_SETS[category]
+    # Give a useful mixed set for general emoji requests; no image-generation call needed.
+    return " ".join(EMOJI_SETS.values())
+
+
+def chat(message, image, history):
     message = (message or "").strip()
     history = history or []
-    if not message:
+    if not message and image is None:
         return history
 
-    quick_answer = quick_math_answer(message)
-    if quick_answer is not None:
+    emoji_answer = emoji_request_reply(message) if image is None else None
+    quick_answer = quick_math_answer(message) if image is None else None
+    instant_answer = emoji_answer if emoji_answer is not None else quick_answer
+    if instant_answer is not None:
         updated = list(history)
         updated.extend([
             {"role": "user", "content": message},
-            {"role": "assistant", "content": quick_answer},
+            {"role": "assistant", "content": instant_answer},
         ])
         return updated
 
@@ -276,10 +301,20 @@ def chat(message, history):
                 parts=[types.Part.from_text(text=content)],
             ))
 
-    conversation.append(types.Content(
-        role="user",
-        parts=[types.Part.from_text(text=message)],
+    user_parts = []
+    if image is not None:
+        try:
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, format="JPEG", quality=85, optimize=True)
+            user_parts.append(types.Part.from_bytes(
+                data=buffer.getvalue(), mime_type="image/jpeg"
+            ))
+        except Exception as exc:
+            raise gr.Error(f"Could not prepare the uploaded picture: {exc}")
+    user_parts.append(types.Part.from_text(
+        text=message or "Please describe this picture and explain what it is showing."
     ))
+    conversation.append(types.Content(role="user", parts=user_parts))
 
     try:
         answer = ask_gemini(conversation)
@@ -323,7 +358,7 @@ def generate_image(prompt):
 
     try:
         response = requests.post(
-            endpoint, headers=headers, json={"prompt": prompt},
+            endpoint, headers=headers, json={"prompt": prompt[:2048], "steps": IMAGE_STEPS},
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -462,19 +497,26 @@ with gr.Blocks(title="Alpha AI") as app:
 
     with gr.Tab("AI Chat"):
         chatbot = gr.Chatbot(height=450, label="Alpha Assistant")
+        chat_picture = gr.Image(
+            type="pil", label="Attach a picture (optional)", height=180
+        )
         with gr.Row():
             chat_input = gr.Textbox(
-                placeholder="Message Alpha...", label="", show_label=False,
-                scale=6, lines=1,
+                placeholder="Message Alpha or ask a question about your picture...",
+                label="", show_label=False, scale=6, lines=1,
             )
             send_button = gr.Button("Send", variant="primary", scale=1)
 
-        gr.Markdown("Ask Alpha a question or enter a numerical problem.", elem_classes=["alpha-note"])
+        gr.Markdown(
+            "Ask questions, request emojis, or attach a picture and ask "
+            "'What is this picture showing?' 📷",
+            elem_classes=["alpha-note"],
+        )
         send_button.click(
-            fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot]
+            fn=chat, inputs=[chat_input, chat_picture, chatbot], outputs=[chatbot]
         ).then(fn=lambda: "", inputs=None, outputs=[chat_input])
         chat_input.submit(
-            fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot]
+            fn=chat, inputs=[chat_input, chat_picture, chatbot], outputs=[chatbot]
         ).then(fn=lambda: "", inputs=None, outputs=[chat_input])
         clear_button = gr.Button("Clear chat")
         clear_button.click(fn=clear_chat, inputs=None, outputs=[chatbot, chat_input])
@@ -533,5 +575,4 @@ if __name__ == "__main__":
         server_port=port,
         theme=gr.themes.Soft(),
         css=CSS,
-        )
-    
+    )
