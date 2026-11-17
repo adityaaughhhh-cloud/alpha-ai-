@@ -513,24 +513,33 @@ def analyze_image(image, question):
 def analyze_video(video_path, question):
     if not video_path:
         raise gr.Error("Please upload a video first.")
+
     client = require_gemini()
     uploaded_file = None
+
     try:
         uploaded_file = client.files.upload(file=video_path)
         deadline = time.time() + VIDEO_PROCESSING_TIMEOUT
+        file_info = uploaded_file
+
         while time.time() < deadline:
             file_info = client.files.get(name=uploaded_file.name)
             state = getattr(file_info, "state", "")
             state_name = getattr(state, "name", str(state)).upper()
-             if "ACTIVE" in state_name:
+
+            if "ACTIVE" in state_name:
                 break
+
             if "FAILED" in state_name:
                 raise gr.Error("Gemini could not process this video.")
+
             time.sleep(2)
         else:
             raise gr.Error("Video processing timed out. Try a shorter video.")
+
         prompt = (question or "").strip() or "Summarize and analyze this video."
         return ask_gemini([file_info, prompt])
+
     except gr.Error:
         raise
     except Exception as exc:
@@ -542,7 +551,6 @@ def analyze_video(video_path, question):
                 client.files.delete(name=uploaded_file.name)
             except Exception:
                 logger.warning("Could not delete temporary Gemini video file.")
-
 
 # ------------------------------
 # Interface
