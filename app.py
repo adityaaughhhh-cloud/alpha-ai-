@@ -27,7 +27,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-2.5-flash").strip()
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.8-flash").strip()
 IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 MAX_CHAT_HISTORY = 20
