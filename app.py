@@ -1,8 +1,7 @@
 import os
 import io
 import time
-import mimetypes
-import tempfile
+import base64
 import logging
 import ast
 import operator
@@ -15,10 +14,11 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
+
 # ============================================================
 # ALPHA AI
-# Chat, image generation, image analysis, video analysis,
-# and push-to-talk voice assistance.
+# Chat, image generation, image analysis, and video analysis.
+# Voice features have been removed.
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -34,162 +34,147 @@ IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
 MAX_CHAT_HISTORY = 12
 VIDEO_PROCESSING_TIMEOUT = 120
-REQUEST_TIMEOUT = 90
-MAX_OUTPUT_TOKENS = 450
-
-# A short system instruction keeps normal answers useful and reduces latency.
-SYSTEM_INSTRUCTION = (
-    "You are Alpha, a helpful AI assistant. Answer the user's exact question "
-    "clearly and accurately. For ordinary questions, use about 2-5 concise "
-    "sentences. For numerical questions, show the key calculation and final "
-    "answer. Do not add unnecessary introductions or long explanations. "
-    "Use plain text and Unicode symbols where possible. Do not wrap equations "
-    "or ordinary text in LaTeX dollar signs."
-)
+REQUEST_TIMEOUT = 120
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "512"))
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
+# ------------------------------
+# Shared helpers
+# ------------------------------
+
 def require_gemini():
     if gemini_client is None:
-        raise gr.Error("GEMINI_API_KEY is missing. Add it in Render > Environment, then redeploy Alpha AI.")
+        raise gr.Error(
+            "GEMINI_API_KEY is missing. Add it in Render > Environment, "
+            "then redeploy Alpha AI."
+        )
     return gemini_client
 
 
-def clean_ai_formatting(text):
-    """Convert common LaTeX output to readable plain text; remove raw delimiters."""
-    text = str(text or "")
-    text = text.replace("\\(", "").replace("\\)", "")
-    text = text.replace("\\[", "").replace("\\]", "")
-    text = text.replace("$$", "")
-    text = text.replace("$", "")
+def clean_ai_text(text):
+    """Convert common raw LaTeX markup into readable plain Unicode text."""
+    if not text:
+        return ""
 
+    text = str(text)
     replacements = {
-        r"\\cdot": "·", r"\\times": "×", r"\\div": "÷",
-        r"\\rightarrow": "→", r"\\to": "→", r"\\Rightarrow": "⇒",
-        r"\\leq": "≤", r"\\geq": "≥", r"\\neq": "≠",
-        r"\\approx": "≈", r"\\pm": "±", r"\\pi": "π",
-        r"\\degree": "°", r"\\%": "%", r"\\infty": "∞",
-        r"\\,": " ", r"\\;": " ", r"\\!": "",
+        r"\\rightarrow": " → ",
+        r"\\to": " → ",
+        r"\\times": " × ",
+        r"\\div": " ÷ ",
+        r"\\pm": " ± ",
+        r"\\neq": " ≠ ",
+        r"\\leq": " ≤ ",
+        r"\\geq": " ≥ ",
+        r"\\approx": " ≈ ",
+        r"\\Delta": "Δ",
+        r"\\alpha": "α",
+        r"\\beta": "β",
+        r"\\pi": "π",
+        r"\\infty": "∞",
+        r"\\cdot": " · ",
+        r"\\degree": "°",
+        r"\\%": "%",
+        r"\\ ": " ",
     }
     for old, new in replacements.items():
-        text = re.sub(old, new, text)
+        text = text.replace(old, new)
 
-    text = re.sub(r"\\(?:text|mathrm|mathbf|mathit)\s*\{([^{}]*)\}", r"\1", text)
-    text = re.sub(r"\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}", r"(\1/\2)", text)
-    text = re.sub(r"\\sqrt\s*\{([^{}]+)\}", r"√(\1)", text)
+    # Remove common LaTeX wrappers and formatting commands.
+    text = re.sub(r"\\(?:text|mathrm|mathbf|operatorname)\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\(?:left|right)\b", "", text)
+    text = re.sub(r"\\(?:displaystyle|textstyle)\b", "", text)
+    text = text.replace(r"\(", "").replace(r"\)", "")
+    text = text.replace(r"\[", "").replace(r"\]", "")
+    text = text.replace("$$", "").replace("$", "")
+
+    # Convert simple chemical/math subscripts, e.g. CO_{2}, H_2O.
+    sub_map = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+    text = re.sub(
+        r"_\{([0-9+\-=()]+)\}|_([0-9])",
+        lambda m: (m.group(1) or m.group(2)).translate(sub_map),
+        text,
+    )
+
+    # Convert common powers, e.g. x^{2}, m^2.
+    sup_map = str.maketrans("0123456789+-=()", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾")
+    text = re.sub(
+        r"\^\{([0-9+\-=()]+)\}|\^([0-9])",
+        lambda m: (m.group(1) or m.group(2)).translate(sup_map),
+        text,
+    )
+
+    # Remove leftover LaTeX command slashes while retaining their words.
     text = re.sub(r"\\([A-Za-z]+)", r"\1", text)
-
-    # Convert common numeric subscripts/superscripts: CO2 -> CO₂, x^2 -> x².
-    sub_digits = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
-    super_digits = str.maketrans("0123456789+-=()", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾")
-    text = re.sub(r"([A-Za-z)])_\{?([0-9]+)\}?", lambda m: m.group(1) + m.group(2).translate(sub_digits), text)
-    text = re.sub(r"([A-Za-z0-9)])\^\{?([0-9+\-=()]+)\}?", lambda m: m.group(1) + m.group(2).translate(super_digits), text)
-
-    # Remove leftover braces used only for simple formatting.
     text = text.replace("{", "").replace("}", "")
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
-
-
-def make_speech_file(text):
-    text = (text or "").strip()
-    if not text:
-        return None
-    output_path = None
-    try:
-        from gtts import gTTS
-        with tempfile.NamedTemporaryFile(suffix=".mp3", prefix="alpha_voice_", delete=False) as temp:
-            output_path = temp.name
-        gTTS(text=text[:2500], lang="en").save(output_path)
-        return output_path
-    except Exception:
-        logger.exception("Text-to-speech failed")
-        if output_path and os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except OSError:
-                pass
-        return None
-
-
-def transcribe_audio(audio_path):
-    if not audio_path:
-        raise gr.Error("Please record a voice message first.")
-    client = require_gemini()
-    path = Path(str(audio_path))
-    if not path.is_file():
-        raise gr.Error("The microphone recording could not be found.")
-    mime_type, _ = mimetypes.guess_type(path.name)
-    if not mime_type or not mime_type.startswith("audio/"):
-        mime_type = {
-            ".webm": "audio/webm", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
-            ".ogg": "audio/ogg", ".wav": "audio/wav",
-        }.get(path.suffix.lower(), "audio/wav")
-    try:
-        response = client.models.generate_content(
-            model=CHAT_MODEL,
-            contents=[
-                types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type),
-                "Transcribe the spoken words accurately. Return only the words spoken.",
-            ],
-            config=types.GenerateContentConfig(max_output_tokens=180, temperature=0),
-        )
-        return clean_ai_formatting(response.text or "")
-    except Exception as exc:
-        logger.exception("Audio transcription failed")
-        raise gr.Error(f"Voice transcription failed: {exc}")
 
 
 def _is_temporary_gemini_error(exc):
     message = str(exc).lower()
-    return any(x in message for x in (
-        "503", "429", "500", "502", "504", "unavailable", "high demand",
-        "resource exhausted", "deadline exceeded", "temporarily", "connection reset",
-        "timed out", "timeout",
+    return any(marker in message for marker in (
+        "503", "429", "500", "502", "504", "unavailable",
+        "high demand", "resource exhausted", "deadline exceeded",
+        "temporarily", "connection reset", "timed out", "timeout",
     ))
 
 
 def ask_gemini(contents):
-    """Fast concise generation with one quick retry and optional fallback model."""
+    """Use a concise output budget and a configured fallback if needed."""
     client = require_gemini()
     models = [CHAT_MODEL]
     if CHAT_FALLBACK_MODEL and CHAT_FALLBACK_MODEL != CHAT_MODEL:
         models.append(CHAT_FALLBACK_MODEL)
+
     last_error = None
-    for model_index, model in enumerate(models):
-        attempts = 2 if model_index == 0 else 1
-        for attempt in range(attempts):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_INSTRUCTION,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        temperature=0.3,
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    temperature=0.4,
+                    system_instruction=(
+                        "You are Alpha, a helpful and accurate assistant. "
+                        "Answer directly and clearly. For ordinary questions, "
+                        "use a concise answer unless the user asks for detail. "
+                        "Use readable Unicode symbols in equations, such as "
+                        "CO₂ and H₂O. Do not wrap equations or variables in "
+                        "LaTeX dollar signs. Show calculation steps when useful."
                     ),
+                ),
+            )
+            return clean_ai_text(response.text or "") or (
+                "I couldn't generate a response. Please try again."
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Gemini model %s failed: %s", model, exc)
+            if not _is_temporary_gemini_error(exc):
+                raise gr.Error(
+                    "Alpha could not process this request. Check the Gemini "
+                    "API key and CHAT_MODEL setting in Render."
                 )
-                return clean_ai_formatting(response.text or "") or "I couldn't generate a response."
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Gemini model %s attempt %s failed: %s", model, attempt + 1, exc)
-                if not _is_temporary_gemini_error(exc):
-                    raise gr.Error("Alpha could not process this request. Check the Gemini API key and model name.")
-                if attempt == 0:
-                    time.sleep(0.6)
+
     logger.error("All configured Gemini models failed: %s", last_error)
-    raise gr.Error("Gemini is temporarily busy. Please try again shortly.")
+    raise gr.Error(
+        "Gemini is temporarily busy. Please try again shortly."
+    )
 
 
-# Fast local calculator for arithmetic expressions.
+# ------------------------------
+# Chat and fast local calculator
+# ------------------------------
+
 _MATH_OPERATORS = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod, ast.Pow: operator.pow,
-    ast.USub: operator.neg, ast.UAdd: operator.pos,
+    ast.Add: operator.add, ast.Sub: operator.sub,
+    ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
+    ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos,
 }
 
 
@@ -212,7 +197,7 @@ def _safe_math(node):
 
 
 def quick_math_answer(message):
-    text = (message or "").lower().replace(",", "")
+    text = message.lower().replace(",", "")
     text = re.sub(r"\b(what is|what's|calculate|compute|solve|answer|please)\b", " ", text)
     text = text.replace("×", "*").replace("÷", "/").replace("−", "-")
     text = re.sub(r"\bplus\b", "+", text)
@@ -231,87 +216,114 @@ def quick_math_answer(message):
         return None
 
 
-def chat(message, history, speak=False):
+def chat(message, history):
     message = (message or "").strip()
     history = history or []
     if not message:
-        return history, None, None
+        return history
 
     quick_answer = quick_math_answer(message)
     if quick_answer is not None:
-        answer = quick_answer
-    else:
-        conversation = []
-        for item in history[-MAX_CHAT_HISTORY:]:
-            if not isinstance(item, dict):
-                continue
-            role, content = item.get("role"), item.get("content")
-            if role in ("user", "assistant") and isinstance(content, str):
-                conversation.append(types.Content(
-                    role="user" if role == "user" else "model",
-                    parts=[types.Part.from_text(text=content)],
-                ))
-        conversation.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
-        try:
-            answer = ask_gemini(conversation)
-        except gr.Error as exc:
-            answer = str(exc)
+        updated = list(history)
+        updated.extend([
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": quick_answer},
+        ])
+        return updated
 
-    new_history = list(history)
-    new_history.extend([
+    conversation = []
+    for item in history[-MAX_CHAT_HISTORY:]:
+        if not isinstance(item, dict):
+            continue
+        role, content = item.get("role"), item.get("content")
+        if role in ("user", "assistant") and isinstance(content, str):
+            conversation.append(types.Content(
+                role="user" if role == "user" else "model",
+                parts=[types.Part.from_text(text=content)],
+            ))
+
+    conversation.append(types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=message)],
+    ))
+
+    try:
+        answer = ask_gemini(conversation)
+    except gr.Error as exc:
+        answer = str(exc)
+
+    updated = list(history)
+    updated.extend([
         {"role": "user", "content": message},
         {"role": "assistant", "content": answer},
     ])
-    # Text chat skips TTS so the user sees the answer immediately.
-    audio_path = make_speech_file(answer) if speak else None
-    return new_history, audio_path, audio_path
-
-
-def voice_chat(audio_path, history):
-    history = history or []
-    try:
-        transcript = transcribe_audio(audio_path)
-        if not transcript:
-            return history, None, "", None
-        updated_history, response_audio, saved_audio = chat(transcript, history, speak=True)
-        return updated_history, response_audio, transcript, saved_audio
-    except gr.Error as exc:
-        return history, None, str(exc), None
-
-
-def replay_audio(audio_path):
-    return audio_path if audio_path and os.path.isfile(audio_path) else None
-
-
-def stop_audio():
-    return None
+    return updated
 
 
 def clear_chat():
-    return [], None, None, "", None
+    return [], ""
 
 
+# ------------------------------
 # Image generation (Cloudflare FLUX)
+# ------------------------------
+
 def generate_image(prompt):
     prompt = (prompt or "").strip()
     if not prompt:
         raise gr.Error("Please enter an image description.")
     if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        raise gr.Error("Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in Render Environment.")
-    endpoint = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{IMAGE_MODEL}"
-    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"}
+        raise gr.Error(
+            "Cloudflare credentials are missing. Add CLOUDFLARE_API_TOKEN "
+            "and CLOUDFLARE_ACCOUNT_ID in Render Environment."
+        )
+
+    endpoint = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{IMAGE_MODEL}"
+    )
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        response = requests.post(endpoint, headers=headers, json={"prompt": prompt}, timeout=REQUEST_TIMEOUT)
+        response = requests.post(
+            endpoint, headers=headers, json={"prompt": prompt},
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
-        if "application/json" in response.headers.get("content-type", "").lower():
+        content_type = response.headers.get("content-type", "").lower()
+
+        # Cloudflare FLUX commonly returns JSON containing a base64 image.
+        if "application/json" in content_type or response.content[:1] == b"{":
             try:
-                detail = response.json().get("errors") or response.json().get("messages") or response.json()
+                data = response.json()
             except ValueError:
-                detail = response.text[:500]
-            raise gr.Error(f"Cloudflare did not return an image: {detail}")
+                raise gr.Error("Cloudflare returned invalid JSON.")
+
+            result = data.get("result") or {}
+            image_data = result.get("image") if isinstance(result, dict) else None
+            if not image_data and isinstance(data, dict):
+                image_data = data.get("image")
+
+            if not image_data:
+                detail = data.get("errors") or data.get("messages") or "No image field was returned."
+                raise gr.Error(f"Cloudflare image generation failed: {detail}")
+
+            try:
+                image_bytes = base64.b64decode(image_data)
+                image = Image.open(io.BytesIO(image_bytes))
+                image.load()
+                return image.convert("RGB")
+            except Exception as exc:
+                logger.exception("Could not decode Cloudflare base64 image")
+                raise gr.Error(f"Cloudflare returned image data that could not be decoded: {exc}")
+
         image = Image.open(io.BytesIO(response.content))
         image.load()
         return image.convert("RGB")
+
     except gr.Error:
         raise
     except requests.RequestException as exc:
@@ -322,21 +334,19 @@ def generate_image(prompt):
         raise gr.Error(f"Could not read the generated image: {exc}")
 
 
-def generate_image_from_voice(audio_path):
-    prompt = transcribe_audio(audio_path)
-    if not prompt:
-        raise gr.Error("Alpha could not understand the voice prompt.")
-    return generate_image(prompt), prompt
-
-
+# ------------------------------
 # Image analysis
+# ------------------------------
+
 def analyze_image(image, question):
     if image is None:
         raise gr.Error("Please upload an image first.")
     try:
         buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="JPEG", quality=85)
-        image_part = types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg")
+        image.convert("RGB").save(buffer, format="JPEG", quality=88)
+        image_part = types.Part.from_bytes(
+            data=buffer.getvalue(), mime_type="image/jpeg"
+        )
         prompt = (question or "").strip() or "Describe this image."
         return ask_gemini([image_part, prompt])
     except gr.Error:
@@ -346,16 +356,21 @@ def analyze_image(image, question):
         raise gr.Error(f"Image analysis failed: {exc}")
 
 
+# ------------------------------
 # Video analysis only
+# ------------------------------
+
 def analyze_video(video_path, question):
     if not video_path:
         raise gr.Error("Please upload a video first.")
+
     client = require_gemini()
     uploaded_file = None
     try:
         uploaded_file = client.files.upload(file=video_path)
         deadline = time.time() + VIDEO_PROCESSING_TIMEOUT
         file_info = uploaded_file
+
         while time.time() < deadline:
             file_info = client.files.get(name=uploaded_file.name)
             state = getattr(file_info, "state", "")
@@ -367,8 +382,10 @@ def analyze_video(video_path, question):
             time.sleep(2)
         else:
             raise gr.Error("Video processing timed out. Please try a shorter video.")
+
         prompt = (question or "").strip() or "Summarize and analyze this video."
         return ask_gemini([file_info, prompt])
+
     except gr.Error:
         raise
     except Exception as exc:
@@ -382,89 +399,105 @@ def analyze_video(video_path, question):
                 logger.warning("Could not delete temporary Gemini video file.")
 
 
-def voice_to_text(audio_path):
-    transcript = transcribe_audio(audio_path)
-    if not transcript:
-        raise gr.Error("Alpha could not understand the recording.")
-    return transcript
-
+# ------------------------------
+# Interface styling
+# ------------------------------
 
 CSS = """
-.gradio-container { max-width: 1200px !important; margin: auto !important; }
-footer { display: none !important; }
-#alpha-mic { min-width: 76px !important; max-width: 92px !important; align-self: end !important; }
-#alpha-mic label { display: none !important; }
-#alpha-mic .wrap { min-height: 54px !important; border-radius: 18px !important; border: 1px solid #2563eb !important; background: #2563eb !important; overflow: hidden !important; }
-#alpha-mic button { color: white !important; }
-#alpha-mic audio { max-width: 100% !important; }
-#alpha-send button { min-height: 54px !important; border-radius: 16px !important; }
-#alpha-chat-input textarea { min-height: 54px !important; border-radius: 16px !important; }
-.alpha-note { opacity: 0.75; font-size: 0.9rem; }
+.gradio-container {
+    max-width: 1200px !important;
+    margin: auto !important;
+}
+footer {
+    display: none !important;
+}
+.alpha-note {
+    opacity: 0.75;
+    font-size: 0.9rem;
+}
 """
 
 with gr.Blocks(title="Alpha AI") as app:
-    gr.Markdown("# ALPHA AI\n### Think Beyond Limits.\nChat, create images, analyze images and videos, and talk to Alpha.")
+    gr.Markdown(
+        """
+        # ALPHA AI
+        ### Think Beyond Limits.
+        Chat, create images, analyze images and videos.
+        """
+    )
 
     with gr.Tab("AI Chat"):
         chatbot = gr.Chatbot(height=450, label="Alpha Assistant")
-        with gr.Row(equal_height=True):
-            chat_input = gr.Textbox(placeholder="Message Alpha...", label="", show_label=False, scale=6, elem_id="alpha-chat-input", lines=1)
-            chat_microphone = gr.Audio(sources=["microphone"], type="filepath", label=None, show_label=False, container=False, elem_id="alpha-mic", scale=1)
-            send_button = gr.Button("Send", variant="primary", scale=1, elem_id="alpha-send")
-        gr.Markdown("Tap the microphone control to record a message. When recording is submitted, Alpha transcribes it and replies.", elem_classes=["alpha-note"])
-        recognized_text = gr.Textbox(label="Voice transcription", interactive=False, visible=False)
-        response_audio = gr.Audio(label="Alpha voice response", autoplay=True)
-        last_chat_audio = gr.State(None)
         with gr.Row():
-            replay_button = gr.Button("Replay response")
-            stop_button = gr.Button("⏹ Stop audio")
-            clear_button = gr.Button("Clear chat")
+            chat_input = gr.Textbox(
+                placeholder="Message Alpha...", label="", show_label=False,
+                scale=6, lines=1,
+            )
+            send_button = gr.Button("Send", variant="primary", scale=1)
 
-        send_event = send_button.click(fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot, response_audio, last_chat_audio])
-        send_event.then(fn=lambda: "", inputs=None, outputs=[chat_input])
-        submit_event = chat_input.submit(fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot, response_audio, last_chat_audio])
-        submit_event.then(fn=lambda: "", inputs=None, outputs=[chat_input])
-        chat_microphone.change(fn=voice_chat, inputs=[chat_microphone, chatbot], outputs=[chatbot, response_audio, recognized_text, last_chat_audio])
-        replay_button.click(fn=replay_audio, inputs=[last_chat_audio], outputs=[response_audio])
-        stop_button.click(fn=stop_audio, inputs=None, outputs=[response_audio])
-        clear_button.click(fn=clear_chat, inputs=None, outputs=[chatbot, response_audio, last_chat_audio, recognized_text, chat_input])
+        gr.Markdown("Ask Alpha a question or enter a numerical problem.", elem_classes=["alpha-note"])
+        send_button.click(
+            fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot]
+        ).then(fn=lambda: "", inputs=None, outputs=[chat_input])
+        chat_input.submit(
+            fn=chat, inputs=[chat_input, chatbot], outputs=[chatbot]
+        ).then(fn=lambda: "", inputs=None, outputs=[chat_input])
+        clear_button = gr.Button("Clear chat")
+        clear_button.click(fn=clear_chat, inputs=None, outputs=[chatbot, chat_input])
 
     with gr.Tab("Image Studio"):
         gr.Markdown("## Create images with Alpha")
-        image_prompt = gr.Textbox(label="Image description", placeholder="Describe the image you want...")
-        image_voice = gr.Audio(sources=["microphone"], type="filepath", label="Speak your image prompt")
-        with gr.Row():
-            image_button = gr.Button("Generate image", variant="primary")
-            voice_prompt_button = gr.Button("Generate from voice")
+        image_prompt = gr.Textbox(
+            label="Image description",
+            placeholder="Describe the image you want...",
+        )
+        image_button = gr.Button("Generate image", variant="primary")
         generated_image = gr.Image(label="Generated image", type="pil")
-        image_button.click(fn=generate_image, inputs=[image_prompt], outputs=[generated_image])
-        voice_prompt_button.click(fn=generate_image_from_voice, inputs=[image_voice], outputs=[generated_image, image_prompt])
+        image_button.click(
+            fn=generate_image, inputs=[image_prompt], outputs=[generated_image]
+        )
 
     with gr.Tab("Image Analysis"):
         uploaded_image = gr.Image(type="pil", label="Upload image")
-        image_question = gr.Textbox(label="Your question", placeholder="What is in this image?")
-        analysis_voice = gr.Audio(sources=["microphone"], type="filepath", label="Ask Alpha by voice")
-        transcribe_image_button = gr.Button("Convert voice to text")
+        image_question = gr.Textbox(
+            label="Your question", placeholder="What is in this image?"
+        )
         analyze_image_button = gr.Button("Analyze image", variant="primary")
-        image_result = gr.Textbox(label="Alpha's analysis", lines=6)
-        image_speech = gr.Audio(label="Listen to analysis", autoplay=True)
-        transcribe_image_button.click(fn=voice_to_text, inputs=[analysis_voice], outputs=[image_question])
-        analyze_image_button.click(fn=analyze_image, inputs=[uploaded_image, image_question], outputs=[image_result]).then(fn=make_speech_file, inputs=[image_result], outputs=[image_speech])
+        image_result = gr.Textbox(label="Alpha's analysis", lines=8)
+        analyze_image_button.click(
+            fn=analyze_image,
+            inputs=[uploaded_image, image_question],
+            outputs=[image_result],
+        )
 
     with gr.Tab("Video Analysis"):
-        gr.Markdown("## Analyze videos\nUpload a video and ask Alpha questions about its contents.")
+        gr.Markdown(
+            "## Analyze videos\n"
+            "Upload a video and ask Alpha questions about its contents."
+        )
         uploaded_video = gr.Video(label="Upload video")
-        video_question = gr.Textbox(label="Your question", placeholder="Summarize this video...")
-        video_voice = gr.Audio(sources=["microphone"], type="filepath", label="Ask Alpha by voice")
-        video_transcribe_button = gr.Button("Convert voice to text")
+        video_question = gr.Textbox(
+            label="Your question", placeholder="Summarize this video..."
+        )
         video_analyze_button = gr.Button("Analyze video", variant="primary")
-        video_result = gr.Textbox(label="Video analysis", lines=7)
-        video_speech = gr.Audio(label="Listen to video analysis", autoplay=True)
-        video_transcribe_button.click(fn=voice_to_text, inputs=[video_voice], outputs=[video_question])
-        video_analyze_button.click(fn=analyze_video, inputs=[uploaded_video, video_question], outputs=[video_result]).then(fn=make_speech_file, inputs=[video_result], outputs=[video_speech])
+        video_result = gr.Textbox(label="Video analysis", lines=8)
+        video_analyze_button.click(
+            fn=analyze_video,
+            inputs=[uploaded_video, video_question],
+            outputs=[video_result],
+        )
 
+
+# ------------------------------
+# Render-compatible server start
+# ------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    app.launch(server_name="0.0.0.0", server_port=port, theme=gr.themes.Soft(), css=CSS)
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        theme=gr.themes.Soft(),
+        css=CSS,
+    )
     
