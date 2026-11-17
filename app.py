@@ -660,7 +660,7 @@ with gr.Blocks(title="Alpha AI") as app:
         )
         video_voice = gr.Audio(
             sources=["microphone"],
-            type="filep    
+            type="filep",    
             label="Ask Alpha by voice",
         )
         video_transcribe_button = gr.Button("Convert voice to text")
