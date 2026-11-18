@@ -4,7 +4,6 @@ import time
 import base64
 import logging
 import tempfile
-from pathlib import Path
 
 import gradio as gr
 import requests
@@ -12,73 +11,94 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# ---------------- CONFIGURATION ----------------
+# ==============================
+# ALPHA CONFIGURATION
+# ==============================
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("Alpha")
+logger = logging.getLogger("AlphaAI")
 
 PORT = int(os.environ.get("PORT", "10000"))
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
-CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL", "gemini-2.5-flash"
-)
-
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 IMAGE_MODEL = os.environ.get(
     "IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
 )
 
-MAX_HISTORY_MESSAGES = 10
-MAX_OUTPUT_TOKENS = 1024
+MAX_HISTORY = 8
+MAX_TOKENS = 1024
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# ---------------- HELPERS ----------------
 
-def check_gemini():
-    if not client:
-        raise gr.Error("GEMINI_API_KEY is missing in Render environment variables.")
+# ==============================
+# HELPER FUNCTIONS
+# ==============================
 
-def check_cloudflare():
+def require_gemini():
+    if client is None:
+        raise gr.Error("Missing GEMINI_API_KEY in Render environment variables.")
+
+
+def require_cloudflare():
     if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        raise gr.Error("Cloudflare API token or account ID is missing.")
+        raise gr.Error(
+            "Missing CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID."
+        )
 
-def clean_history(history):
+
+def safe_history(history):
     if not isinstance(history, list):
         return []
 
-    cleaned = []
-    for item in history[-MAX_HISTORY_MESSAGES:]:
+    result = []
+
+    for item in history[-MAX_HISTORY:]:
         if not isinstance(item, dict):
             continue
 
         role = item.get("role")
         content = item.get("content")
 
-        if role in ("user", "assistant") and isinstance(content, str):
-            cleaned.append({"role": role, "content": content})
+        if role in ["user", "assistant"] and isinstance(content, str):
+            result.append({
+                "role": role,
+                "content": content
+            })
 
-    return cleaned
+    return result
 
-def friendly_error(error):
-    logger.exception("Alpha request failed")
-    return f"Alpha could not complete that request. Please try again. ({str(error)[:250]})"
 
-# ---------------- CHAT ----------------
+def error_text(error):
+    logger.exception("Alpha error")
+    return f"Request failed: {str(error)[:400]}"
 
-def chat(message, history):
+
+def make_output_folder():
+    folder = os.path.join(tempfile.gettempdir(), "alpha_ai_files")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+# ==============================
+# CHAT
+# ==============================
+
+def chat_reply(message, history):
     if not message or not message.strip():
-        return clean_history(history), ""
+        return safe_history(history), ""
 
     try:
-        check_gemini()
+        require_gemini()
 
-        history = clean_history(history)
+        history = safe_history(history)
 
         contents = []
+
         for item in history:
             contents.append(
                 types.Content(
@@ -98,41 +118,44 @@ def chat(message, history):
             model=GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=MAX_OUTPUT_TOKENS
+                temperature=0.65,
+                max_output_tokens=MAX_TOKENS
             )
         )
 
-        answer = response.text or "I could not generate a response."
+        answer = response.text or "Alpha couldn't generate an answer."
 
-        history.append({"role": "user", "content": message})
+        history.append({"role": "user", "content": message.strip()})
         history.append({"role": "assistant", "content": answer})
 
         return history, ""
 
-    except Exception as e:
-        logger.exception("Chat error")
-        history = clean_history(history)
-        history.append({"role": "user", "content": message})
+    except Exception as error:
+        history = safe_history(history)
+        history.append({"role": "user", "content": message.strip()})
         history.append({
             "role": "assistant",
-            "content": friendly_error(e)
+            "content": error_text(error)
         })
         return history, ""
+
 
 def clear_chat():
     return [], ""
 
-# ---------------- IMAGE GENERATION ----------------
 
-def generate_image(prompt, ratio):
+# ==============================
+# IMAGE GENERATION
+# ==============================
+
+def create_image(prompt, ratio):
     if not prompt or not prompt.strip():
-        raise gr.Error("Please enter an image description.")
+        raise gr.Error("Enter an image prompt first.")
 
     try:
-        check_cloudflare()
+        require_cloudflare()
 
-        dimensions = {
+        sizes = {
             "1:1": (1024, 1024),
             "16:9": (1280, 720),
             "9:16": (720, 1280),
@@ -140,15 +163,17 @@ def generate_image(prompt, ratio):
             "3:4": (768, 1024)
         }
 
-        width, height = dimensions.get(ratio, (1024, 1024))
+        width, height = sizes.get(ratio, (1024, 1024))
 
-        url = (
+        endpoint = (
             "https://api.cloudflare.com/client/v4/accounts/"
-            f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{IMAGE_MODEL}"
+            + CLOUDFLARE_ACCOUNT_ID
+            + "/ai/run/"
+            + IMAGE_MODEL
         )
 
         headers = {
-            "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+            "Authorization": "Bearer " + CLOUDFLARE_API_TOKEN,
             "Content-Type": "application/json"
         }
 
@@ -160,7 +185,7 @@ def generate_image(prompt, ratio):
         }
 
         response = requests.post(
-            url,
+            endpoint,
             headers=headers,
             json=payload,
             timeout=120
@@ -168,56 +193,56 @@ def generate_image(prompt, ratio):
 
         if not response.ok:
             raise RuntimeError(
-                f"Cloudflare error {response.status_code}: {response.text[:400]}"
+                f"Image API error {response.status_code}: "
+                f"{response.text[:300]}"
             )
 
-        content_type = response.headers.get("content-type", "")
+        content_type = response.headers.get("Content-Type", "")
 
-        if "image/" in content_type:
+        if content_type.startswith("image/"):
             image_bytes = response.content
         else:
             data = response.json()
 
-            if not data.get("success", True):
+            if not data.get("success", False):
                 raise RuntimeError(str(data.get("errors", data)))
 
-            result = data.get("result", {})
-            encoded = result.get("image")
+            image_data = data.get("result", {}).get("image")
 
-            if not encoded:
-                raise RuntimeError("Cloudflare did not return an image.")
+            if not image_data:
+                raise RuntimeError("No image data returned by API.")
 
-            image_bytes = base64.b64decode(encoded)
+            image_bytes = base64.b64decode(image_data)
 
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        output_dir = Path(tempfile.gettempdir()) / "alpha_images"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         filename = f"alpha_{int(time.time() * 1000)}.png"
-        output_path = output_dir / filename
+        output_path = os.path.join(make_output_folder(), filename)
 
         image.save(output_path, format="PNG")
 
-        return str(output_path), str(output_path)
+        return output_path, output_path
 
-    except Exception as e:
-        raise gr.Error(f"Image generation failed: {str(e)[:300]}")
+    except Exception as error:
+        logger.exception("Image generation failed")
+        raise gr.Error(str(error)[:400])
 
-# ---------------- IMAGE ANALYSIS ----------------
+
+# ==============================
+# IMAGE ANALYSIS
+# ==============================
 
 def analyze_image(image_path, question):
     if not image_path:
-        raise gr.Error("Please upload an image.")
+        return "Please upload an image first."
 
     try:
-        check_gemini()
+        require_gemini()
 
         image = Image.open(image_path).convert("RGB")
 
         prompt = question.strip() if question and question.strip() else (
-            "Describe this image clearly. Identify its main objects, "
-            "details, and important information."
+            "Describe the image, its objects, scene, and important details."
         )
 
         response = client.models.generate_content(
@@ -229,45 +254,50 @@ def analyze_image(image_path, question):
             )
         )
 
-        return response.text or "I could not analyze this image."
+        return response.text or "No analysis was returned."
 
-    except Exception as e:
-        return friendly_error(e)
+    except Exception as error:
+        return error_text(error)
 
-# ---------------- VIDEO ANALYSIS ----------------
+
+# ==============================
+# VIDEO ANALYSIS
+# ==============================
 
 def analyze_video(video_path, question):
     if not video_path:
-        raise gr.Error("Please upload a video.")
+        return "Please upload a video first."
 
-    uploaded_file = None
+    uploaded = None
 
     try:
-        check_gemini()
+        require_gemini()
 
-        uploaded_file = client.files.upload(file=video_path)
+        uploaded = client.files.upload(file=video_path)
 
-        # Wait for Gemini video processing.
-        for _ in range(60):
-            state = getattr(uploaded_file.state, "name", "")
+        for attempt in range(60):
+            state = getattr(uploaded.state, "name", "")
+
             if state == "ACTIVE":
                 break
+
             if state == "FAILED":
-                raise RuntimeError("Gemini could not process this video.")
+                raise RuntimeError("Video processing failed.")
 
             time.sleep(2)
-            uploaded_file = client.files.get(name=uploaded_file.name)
+            uploaded = client.files.get(name=uploaded.name)
+
         else:
-            raise TimeoutError("Video processing took too long.")
+            raise TimeoutError("Video processing timed out.")
 
         prompt = question.strip() if question and question.strip() else (
-            "Analyze this video. Summarize what happens, describe the "
-            "important scenes, and identify key details."
+            "Summarize this video. Explain the main events, important "
+            "visual details, and what happens in the clip."
         )
 
         video_part = types.Part.from_uri(
-            file_uri=uploaded_file.uri,
-            mime_type=uploaded_file.mime_type
+            file_uri=uploaded.uri,
+            mime_type=uploaded.mime_type
         )
 
         response = client.models.generate_content(
@@ -279,19 +309,22 @@ def analyze_video(video_path, question):
             )
         )
 
-        return response.text or "I could not analyze this video."
+        return response.text or "No video analysis returned."
 
-    except Exception as e:
-        return friendly_error(e)
+    except Exception as error:
+        return error_text(error)
 
     finally:
-        if uploaded_file:
+        if uploaded:
             try:
-                client.files.delete(name=uploaded_file.name)
+                client.files.delete(name=uploaded.name)
             except Exception:
-                logger.warning("Could not delete temporary Gemini video file.")
+                logger.warning("Temporary video cleanup failed.")
 
-# ---------------- USER INTERFACE ----------------
+
+# ==============================
+# ALPHA INTERFACE
+# ==============================
 
 with gr.Blocks(title="Alpha AI") as demo:
 
@@ -299,151 +332,152 @@ with gr.Blocks(title="Alpha AI") as demo:
         """
         # ALPHA AI
         ### Think Beyond Limits.
-        Chat, create images, and analyze images and videos.
+
+        Chat • Image Generation • Image Analysis • Video Analysis
         """
     )
 
     with gr.Tabs():
 
-        # CHAT TAB
+        # -------- CHAT --------
+
         with gr.Tab("Chat"):
+
             chatbot = gr.Chatbot(
-                height=480,
-                show_copy_button=True,
-                placeholder="Welcome to Alpha AI. Ask me anything."
+                height=450,
+                placeholder="Welcome to Alpha. Start a conversation."
             )
 
             with gr.Row():
-                chat_input = gr.Textbox(
+
+                message = gr.Textbox(
                     placeholder="Ask Alpha anything...",
-                    scale=8,
-                    show_label=False
+                    show_label=False,
+                    scale=8
                 )
-                send_button = gr.Button("Send", variant="primary", scale=1)
 
-            clear_button = gr.Button("Clear Chat")
+                send = gr.Button("Send", variant="primary", scale=1)
 
-            send_button.click(
-                chat,
-                inputs=[chat_input, chatbot],
-                outputs=[chatbot, chat_input]
+            clear = gr.Button("Clear conversation")
+
+            send.click(
+                chat_reply,
+                inputs=[message, chatbot],
+                outputs=[chatbot, message]
             )
 
-            chat_input.submit(
-                chat,
-                inputs=[chat_input, chatbot],
-                outputs=[chatbot, chat_input]
+            message.submit(
+                chat_reply,
+                inputs=[message, chatbot],
+                outputs=[chatbot, message]
             )
 
-            clear_button.click(
+            clear.click(
                 clear_chat,
-                outputs=[chatbot, chat_input]
+                inputs=None,
+                outputs=[chatbot, message]
             )
 
-        # IMAGE GENERATION TAB
-        with gr.Tab("Image Studio"):
-            gr.Markdown("### Create images with Alpha")
+        # -------- IMAGE STUDIO --------
 
-            image_prompt = gr.Textbox(
-                label="Image description",
-                placeholder="Describe the image you want to create...",
+        with gr.Tab("Image Studio"):
+
+            gr.Markdown("## Create an image")
+
+            prompt = gr.Textbox(
+                label="Describe your image",
+                placeholder="A futuristic city on Mars...",
                 lines=4
             )
 
-            image_ratio = gr.Dropdown(
+            ratio = gr.Dropdown(
                 choices=["1:1", "16:9", "9:16", "4:3", "3:4"],
                 value="1:1",
-                label="Image ratio"
+                label="Aspect ratio"
             )
 
-            generate_button = gr.Button(
-                "Generate Image",
-                variant="primary"
-            )
+            generate = gr.Button("Generate", variant="primary")
 
-            generated_image = gr.Image(
-                label="Generated Image",
+            image_preview = gr.Image(
+                label="Generated image",
                 type="filepath"
             )
 
-            image_download = gr.File(label="Download Image")
+            image_file = gr.File(label="Download generated image")
 
-            generate_button.click(
-                generate_image,
-                inputs=[image_prompt, image_ratio],
-                outputs=[generated_image, image_download]
+            generate.click(
+                create_image,
+                inputs=[prompt, ratio],
+                outputs=[image_preview, image_file]
             )
 
-        # IMAGE ANALYSIS TAB
-        with gr.Tab("Image Analysis"):
-            gr.Markdown("### Ask Alpha about an image")
+        # -------- IMAGE ANALYSIS --------
 
-            input_image = gr.Image(
-                label="Upload Image",
+        with gr.Tab("Image Analysis"):
+
+            gr.Markdown("## Analyze an image")
+
+            uploaded_image = gr.Image(
+                label="Upload image",
                 type="filepath"
             )
 
             image_question = gr.Textbox(
-                label="Your question",
-                placeholder="What is in this image?",
+                label="Question",
+                placeholder="Explain this image...",
                 lines=2
             )
 
-            image_analyze_button = gr.Button(
-                "Analyze Image",
-                variant="primary"
-            )
+            image_button = gr.Button("Analyze", variant="primary")
 
-            image_result = gr.Textbox(
-                label="Alpha's Analysis",
+            image_answer = gr.Textbox(
+                label="Alpha's answer",
                 lines=10
             )
 
-            image_analyze_button.click(
+            image_button.click(
                 analyze_image,
-                inputs=[input_image, image_question],
-                outputs=image_result
+                inputs=[uploaded_image, image_question],
+                outputs=image_answer
             )
 
-        # VIDEO ANALYSIS TAB
-        with gr.Tab("Video Analysis"):
-            gr.Markdown("### Upload a video and ask Alpha")
+        # -------- VIDEO ANALYSIS --------
 
-            input_video = gr.Video(label="Upload Video")
+        with gr.Tab("Video Analysis"):
+
+            gr.Markdown("## Analyze a video")
+
+            uploaded_video = gr.Video(label="Upload video")
 
             video_question = gr.Textbox(
-                label="Your question",
+                label="Question",
                 placeholder="Summarize this video...",
                 lines=2
             )
 
-            video_analyze_button = gr.Button(
-                "Analyze Video",
-                variant="primary"
-            )
+            video_button = gr.Button("Analyze video", variant="primary")
 
-            video_result = gr.Textbox(
-                label="Alpha's Video Analysis",
+            video_answer = gr.Textbox(
+                label="Alpha's video analysis",
                 lines=12
             )
 
-            video_analyze_button.click(
+            video_button.click(
                 analyze_video,
-                inputs=[input_video, video_question],
-                outputs=video_result
+                inputs=[uploaded_video, video_question],
+                outputs=video_answer
             )
 
-    gr.Markdown(
-        "---\n"
-        "© Alpha AI | Think Beyond Limits."
-    )
+    gr.Markdown("---\n**Alpha AI · Think Beyond Limits**")
 
-# ---------------- START SERVER ----------------
+
+# ==============================
+# START
+# ==============================
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=2).launch(
         server_name="0.0.0.0",
-        server_port=PORT,
-        show_error=True
+        server_port=PORT
     )
     
