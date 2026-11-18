@@ -2,22 +2,29 @@
 import os
 import re
 import ast
+import math
 import time
 import base64
 import operator
 import tempfile
 import logging
-from pathlib import Path
+import threading
+import uuid
 
 import gradio as gr
 import requests
+import numpy as np
+import sympy as sp
+import pint
+
+from scipy import constants
 from PIL import Image
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -40,38 +47,82 @@ IMAGE_MODEL = os.environ.get(
     "@cf/black-forest-labs/flux-1-schnell"
 )
 
-SYSTEM_PROMPT = """
-You are Alpha, a helpful AI assistant.
+CHAT_HISTORY_LIMIT = 8
+MAX_OUTPUT_TOKENS = 900
+GEMINI_TIMEOUT_MS = 45000
 
-Rules:
-- Answer clearly and accurately.
-- Use simple language when appropriate.
-- Give the direct answer first.
-- Avoid unnecessary introductions and repetition.
-- For educational questions, explain step by step when useful.
-- If you are uncertain, say so instead of inventing facts.
+SYSTEM_PROMPT = """
+You are Alpha, a helpful and accurate AI assistant.
+
+- Answer the actual question directly.
+- Use simple and clear language.
+- Avoid unnecessary introductions.
+- Explain difficult topics step by step.
+- Do not invent facts or sources.
+- If uncertain, clearly say so.
 - Keep simple answers concise.
 """
 
-# Create one reusable client instead of creating a new one
-# for every question.
+NUMERICAL_PROMPT = """
+You are Alpha's Universal Numerical Solver.
+
+You solve numerical questions from all subjects and fields:
+
+- Mathematics
+- Arithmetic and algebra
+- Geometry and trigonometry
+- Calculus
+- Statistics and probability
+- Physics
+- Chemistry
+- Engineering
+- Astronomy
+- Finance
+- Computer science
+- Everyday calculations
+- Other scientific and technical fields
+
+For numerical questions:
+
+1. Identify the given values.
+2. Identify what needs to be calculated.
+3. Select the correct formula.
+4. Substitute the values.
+5. Calculate carefully.
+6. Include correct units.
+7. Verify the result.
+8. Give the final answer clearly.
+
+Never invent missing information.
+Never pretend an uncertain answer is verified.
+If information is missing, ask for clarification.
+"""
+
+# Reusable clients
 client = None
+client_lock = threading.Lock()
+
+unit_registry = pint.UnitRegistry()
 
 if GEMINI_API_KEY:
     try:
         client = genai.Client(
             api_key=GEMINI_API_KEY,
-            http_options=types.HttpOptions(timeout=45000)
+            http_options=types.HttpOptions(
+                timeout=GEMINI_TIMEOUT_MS
+            )
         )
+        logger.info("Gemini client initialized.")
+
     except Exception:
-        logger.exception("Could not initialize Gemini client")
+        logger.exception("Gemini initialization failed.")
 
 
 # ============================================================
-# LOCAL MATH ENGINE
+# 2. SAFE MATHEMATICAL EXPRESSION ENGINE
 # ============================================================
 
-MATH_OPERATORS = {
+OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -83,33 +134,183 @@ MATH_OPERATORS = {
     ast.UAdd: operator.pos,
 }
 
+SYMPY_OPERATORS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.Pow: lambda a, b: a ** b,
+}
 
-def safe_math_node(node):
+SYMPY_FUNCTIONS = {
+    "sqrt": sp.sqrt,
+    "sin": sp.sin,
+    "cos": sp.cos,
+    "tan": sp.tan,
+    "asin": sp.asin,
+    "acos": sp.acos,
+    "atan": sp.atan,
+    "log": sp.log,
+    "ln": sp.log,
+    "exp": sp.exp,
+    "abs": sp.Abs,
+    "factorial": sp.factorial,
+}
+
+SYMPY_CONSTANTS = {
+    "pi": sp.pi,
+    "e": sp.E,
+}
+
+SCIENTIFIC_CONSTANTS = {
+    "c": constants.c,
+    "G": constants.G,
+    "h": constants.h,
+    "k_B": constants.k,
+    "N_A": constants.Avogadro,
+    "R": constants.R,
+}
+
+
+def clean_expression(expression):
+    expression = expression.strip()
+
+    expression = expression.replace("^", "**")
+    expression = expression.replace("×", "*")
+    expression = expression.replace("÷", "/")
+
+    # Convert 2x into 2*x.
+    expression = re.sub(
+        r"(\d)([a-zA-Z])",
+        r"\1*\2",
+        expression
+    )
+
+    # Convert x(x+1) into x*(x+1).
+    expression = re.sub(
+        r"([a-zA-Z0-9)])\(",
+        r"\1*(",
+        expression
+    )
+
+    return expression
+
+
+def safe_sympy_node(node):
     if isinstance(node, ast.Expression):
-        return safe_math_node(node.body)
+        return safe_sympy_node(node.body)
 
     if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)) and not isinstance(
-            node.value, bool
-        ):
+        if isinstance(node.value, (int, float)):
+            return sp.sympify(node.value)
+
+        raise ValueError("Invalid constant")
+
+    if isinstance(node, ast.Name):
+        name = node.id
+
+        if name in SYMPY_CONSTANTS:
+            return SYMPY_CONSTANTS[name]
+
+        if name in SCIENTIFIC_CONSTANTS:
+            return sp.Float(SCIENTIFIC_CONSTANTS[name])
+
+        if re.fullmatch(r"[a-zA-Z]", name):
+            return sp.Symbol(name)
+
+        raise ValueError("Unsupported variable")
+
+    if isinstance(node, ast.UnaryOp):
+        operation = node.op
+
+        if isinstance(operation, ast.USub):
+            return -safe_sympy_node(node.operand)
+
+        if isinstance(operation, ast.UAdd):
+            return safe_sympy_node(node.operand)
+
+        raise ValueError("Unsupported unary operation")
+
+    if isinstance(node, ast.BinOp):
+        operation = SYMPY_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Unsupported operation")
+
+        left = safe_sympy_node(node.left)
+        right = safe_sympy_node(node.right)
+
+        if isinstance(node.op, ast.Pow):
+            if right.is_number and abs(float(right)) > 20:
+                raise ValueError("Exponent too large")
+
+        return operation(left, right)
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Unsupported function")
+
+        function = SYMPY_FUNCTIONS.get(node.func.id)
+
+        if function is None:
+            raise ValueError("Unsupported function")
+
+        if node.keywords or len(node.args) != 1:
+            raise ValueError("Invalid function arguments")
+
+        return function(safe_sympy_node(node.args[0]))
+
+    raise ValueError("Unsupported mathematical expression")
+
+
+def parse_safe_expression(expression):
+    expression = clean_expression(expression)
+
+    if len(expression) > 250:
+        raise ValueError("Expression too long")
+
+    if not re.fullmatch(
+        r"[0-9a-zA-Z_+\-*/().,%\s]+",
+        expression
+    ):
+        raise ValueError("Invalid expression characters")
+
+    tree = ast.parse(expression, mode="eval")
+
+    return safe_sympy_node(tree)
+
+
+# ============================================================
+# 3. FAST ARITHMETIC
+# ============================================================
+
+def safe_arithmetic_node(node):
+    if isinstance(node, ast.Expression):
+        return safe_arithmetic_node(node.body)
+
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
             return node.value
+
         raise ValueError("Invalid number")
 
     if isinstance(node, ast.UnaryOp):
-        operation = MATH_OPERATORS.get(type(node.op))
+        operation = OPERATORS.get(type(node.op))
+
         if operation is None:
             raise ValueError("Invalid operation")
-        return operation(safe_math_node(node.operand))
+
+        return operation(safe_arithmetic_node(node.operand))
 
     if isinstance(node, ast.BinOp):
-        operation = MATH_OPERATORS.get(type(node.op))
+        operation = OPERATORS.get(type(node.op))
+
         if operation is None:
             raise ValueError("Invalid operation")
 
-        left = safe_math_node(node.left)
-        right = safe_math_node(node.right)
+        left = safe_arithmetic_node(node.left)
+        right = safe_arithmetic_node(node.right)
 
-        # Prevent excessively large exponent calculations.
         if isinstance(node.op, ast.Pow):
             if abs(right) > 10 or abs(left) > 100000:
                 raise ValueError("Calculation too large")
@@ -117,6 +318,9 @@ def safe_math_node(node):
         result = operation(left, right)
 
         if isinstance(result, complex):
+            raise ValueError("Invalid result")
+
+        if isinstance(result, float) and not math.isfinite(result):
             raise ValueError("Invalid result")
 
         if abs(result) > 10**100:
@@ -130,12 +334,9 @@ def safe_math_node(node):
 def extract_math_expression(message):
     text = message.strip().lower()
 
-    # Direct expression, for example: 12 - 9
     if re.fullmatch(r"[\d\s.+\-*/()%]+", text):
         return text
 
-    # Natural-language expression, for example:
-    # "what is 12 - 9?"
     patterns = [
         r"^(?:what is|calculate|solve|compute)\s+(.+?)\??$",
         r"^(?:please calculate|please solve)\s+(.+?)\??$",
@@ -143,15 +344,39 @@ def extract_math_expression(message):
 
     for pattern in patterns:
         match = re.match(pattern, text)
+
         if match:
             expression = match.group(1).strip()
+
             if re.fullmatch(r"[\d\s.+\-*/()%]+", expression):
                 return expression
 
     return None
 
 
-def calculate_locally(message):
+def format_result(result):
+    if isinstance(result, sp.Equality):
+        return sp.pretty(result)
+
+    if isinstance(result, sp.Basic):
+        if result.is_number:
+            return str(sp.N(result, 12))
+
+        return sp.pretty(result)
+
+    if isinstance(result, float):
+        if not math.isfinite(result):
+            raise ValueError("Invalid result")
+
+        if result.is_integer():
+            return str(int(result))
+
+        return str(round(result, 10))
+
+    return str(result)
+
+
+def calculate_arithmetic(message):
     expression = extract_math_expression(message)
 
     if not expression:
@@ -159,21 +384,305 @@ def calculate_locally(message):
 
     try:
         tree = ast.parse(expression, mode="eval")
-        result = safe_math_node(tree)
+        result = safe_arithmetic_node(tree)
 
-        if isinstance(result, float):
-            if result.is_integer():
-                return str(int(result))
-            return str(round(result, 10))
-
-        return str(result)
+        return format_result(result)
 
     except Exception:
         return None
 
 
 # ============================================================
-# GEMINI GENERATION
+# 4. UNIVERSAL LOCAL NUMERICAL ENGINE
+# ============================================================
+
+def solve_equation_locally(message):
+    text = message.strip()
+
+    match = re.search(
+        r"(?:solve(?:\s+for\s+[a-zA-Z])?[:\s]+)(.+?=\s*.+)$",
+        text,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    equation_text = match.group(1).strip()
+
+    if equation_text.count("=") != 1:
+        return None
+
+    left_text, right_text = equation_text.split("=", 1)
+
+    try:
+        left = parse_safe_expression(left_text)
+        right = parse_safe_expression(right_text)
+
+        equation = sp.Eq(left, right)
+
+        variables = sorted(
+            equation.free_symbols,
+            key=lambda item: item.name
+        )
+
+        if not variables:
+            return None
+
+        if len(variables) > 3:
+            return None
+
+        solutions = sp.solve(
+            equation,
+            variables,
+            dict=True
+        )
+
+        if not solutions:
+            return "No solution was found."
+
+        lines = ["**Solution:**"]
+
+        for index, solution in enumerate(solutions[:10], 1):
+            values = []
+
+            for variable in variables:
+                if variable in solution:
+                    values.append(
+                        f"{variable} = {format_result(solution[variable])}"
+                    )
+
+            if values:
+                lines.append(
+                    f"{index}. " + ", ".join(values)
+                )
+
+        return "\n".join(lines)
+
+    except Exception as error:
+        logger.debug("Local equation solver skipped: %s", error)
+        return None
+
+
+def solve_calculus_locally(message):
+    text = message.strip().lower()
+
+    differentiate_patterns = [
+        r"^(?:differentiate|find the derivative of|derivative of)\s+(.+)$",
+    ]
+
+    integrate_patterns = [
+        r"^(?:integrate|find the integral of|integral of)\s+(.+)$",
+    ]
+
+    for pattern in differentiate_patterns:
+        match = re.match(pattern, text)
+
+        if match:
+            expression_text = match.group(1)
+
+            try:
+                expression = parse_safe_expression(expression_text)
+                variables = sorted(
+                    expression.free_symbols,
+                    key=lambda item: item.name
+                )
+
+                variable = variables[0] if variables else sp.Symbol("x")
+
+                result = sp.diff(expression, variable)
+
+                return (
+                    "**Derivative:**\n\n"
+                    + f"`{sp.pretty(result)}`"
+                )
+
+            except Exception:
+                return None
+
+    for pattern in integrate_patterns:
+        match = re.match(pattern, text)
+
+        if match:
+            expression_text = match.group(1)
+
+            try:
+                expression = parse_safe_expression(expression_text)
+                variables = sorted(
+                    expression.free_symbols,
+                    key=lambda item: item.name
+                )
+
+                variable = variables[0] if variables else sp.Symbol("x")
+
+                result = sp.integrate(expression, variable)
+
+                return (
+                    "**Integral:**\n\n"
+                    + f"`{sp.pretty(result)} + C`"
+                )
+
+            except Exception:
+                return None
+
+    return None
+
+
+def solve_statistics_locally(message):
+    text = message.strip().lower()
+
+    match = re.search(
+        r"(?:mean|average|median|standard deviation|std)\s+(?:of\s+)?"
+        r"([-+\d.,\s]+)$",
+        text
+    )
+
+    if not match:
+        return None
+
+    try:
+        values = [
+            float(value)
+            for value in re.findall(
+                r"[-+]?\d+(?:\.\d+)?",
+                match.group(1)
+            )
+        ]
+
+        if not values or len(values) > 10000:
+            return None
+
+        data = np.array(values, dtype=float)
+
+        if "median" in text:
+            result = np.median(data)
+            label = "Median"
+
+        elif "standard deviation" in text or "std" in text:
+            result = np.std(data)
+            label = "Standard deviation"
+
+        else:
+            result = np.mean(data)
+            label = "Mean"
+
+        return f"**{label}:** {format_result(float(result))}"
+
+    except Exception:
+        return None
+
+
+def convert_units_locally(message):
+    match = re.match(
+        r"^\s*convert\s+([-+]?\d*\.?\d+)\s+(.+?)\s+to\s+(.+?)\s*$",
+        message,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    value, source_unit, target_unit = match.groups()
+
+    try:
+        quantity = unit_registry.Quantity(
+            float(value),
+            source_unit.strip()
+        )
+
+        converted = quantity.to(target_unit.strip())
+
+        return f"**Answer:** {converted:~P}"
+
+    except Exception:
+        return None
+
+
+def solve_local_numerical(message):
+    # Try fast arithmetic first.
+    result = calculate_arithmetic(message)
+
+    if result is not None:
+        return result
+
+    # Scientific unit conversion.
+    result = convert_units_locally(message)
+
+    if result is not None:
+        return result
+
+    # Statistics.
+    result = solve_statistics_locally(message)
+
+    if result is not None:
+        return result
+
+    # Calculus.
+    result = solve_calculus_locally(message)
+
+    if result is not None:
+        return result
+
+    # Algebra and equations.
+    result = solve_equation_locally(message)
+
+    if result is not None:
+        return result
+
+    return None
+
+
+# ============================================================
+# 5. NUMERICAL QUESTION DETECTOR
+# ============================================================
+
+NUMERICAL_KEYWORDS = [
+    "calculate", "compute", "solve", "evaluate",
+    "find the value", "find x", "find the answer",
+    "numerical", "equation", "percentage", "percent",
+    "ratio", "proportion", "fraction", "average",
+    "probability", "statistics", "mean", "median",
+    "standard deviation", "algebra", "calculus",
+    "differentiate", "derivative", "integrate",
+    "integration", "integral",
+    "velocity", "acceleration", "distance",
+    "displacement", "force", "work done", "power",
+    "energy", "momentum", "current", "voltage",
+    "resistance", "wavelength", "frequency",
+    "pressure", "density", "temperature",
+    "heat", "specific heat", "calorimetry",
+    "mole", "molarity", "molality",
+    "concentration", "equilibrium",
+    "enthalpy", "entropy", "gibbs energy",
+    "stoichiometry", "mass", "volume",
+    "surface area", "perimeter", "area",
+    "trigonometry", "logarithm",
+    "compound interest", "simple interest",
+    "unit conversion", "significant figures"
+]
+
+
+def is_numerical_question(message):
+    text = message.lower()
+
+    has_number = bool(re.search(r"\d", text))
+
+    has_keyword = any(
+        keyword in text for keyword in NUMERICAL_KEYWORDS
+    )
+
+    # Explicitly numerical requests can also contain
+    # equations without digits, such as "solve x + 2 = 5".
+    equation_request = bool(
+        re.search(r"\b(solve|calculate|compute|evaluate)\b", text)
+        and "=" in text
+    )
+
+    return has_keyword or (has_number and has_keyword) or equation_request
+
+
+# ============================================================
+# 6. GEMINI API
 # ============================================================
 
 def check_client():
@@ -181,6 +690,15 @@ def check_client():
         raise RuntimeError(
             "Gemini is not configured. Check GEMINI_API_KEY in Render."
         )
+
+
+def generation_config(numerical=False):
+    prompt = NUMERICAL_PROMPT if numerical else SYSTEM_PROMPT
+
+    return types.GenerateContentConfig(
+        system_instruction=prompt,
+        max_output_tokens=MAX_OUTPUT_TOKENS
+    )
 
 
 def is_temporary_error(error):
@@ -201,90 +719,70 @@ def is_temporary_error(error):
     return any(item in message for item in indicators)
 
 
-def generation_config():
-    return types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        max_output_tokens=900
-    )
-
-
-def generate_with_fallback(contents):
-    """
-    Try the primary model first.
-    Use the backup model if the primary has a temporary failure.
-    """
-
-    check_client()
-
+def get_models():
     models = [GEMINI_MODEL]
 
     if GEMINI_BACKUP_MODEL and GEMINI_BACKUP_MODEL != GEMINI_MODEL:
         models.append(GEMINI_BACKUP_MODEL)
 
+    return models
+
+
+def generate_with_fallback(contents, numerical=False):
+    check_client()
+
     last_error = None
+    models = get_models()
 
     for index, model_name in enumerate(models):
         try:
-            logger.info("Trying Gemini model: %s", model_name)
-
             response = client.models.generate_content(
                 model=model_name,
                 contents=contents,
-                config=generation_config()
+                config=generation_config(numerical)
             )
 
             if response and response.text:
                 return response.text
 
-            raise RuntimeError("Gemini returned an empty response.")
+            raise RuntimeError("Empty Gemini response.")
 
         except Exception as error:
             last_error = error
+
             logger.warning(
-                "Model %s failed: %s",
+                "Gemini model %s failed: %s",
                 model_name,
-                str(error)[:300]
+                str(error)[:250]
             )
 
             if not is_temporary_error(error):
                 break
 
             if index < len(models) - 1:
-                time.sleep(0.3)
+                time.sleep(0.2)
 
     raise RuntimeError(
         "Alpha could not get a response from Gemini. "
-        "Please try again shortly. Details: "
-        + str(last_error)[:300]
+        + str(last_error)[:250]
     )
 
 
-def stream_with_fallback(contents):
-    """
-    Stream the answer from the primary model.
-    If the stream fails before producing text, try the backup.
-    """
-
+def stream_with_fallback(contents, numerical=False):
     check_client()
 
-    models = [GEMINI_MODEL]
-
-    if GEMINI_BACKUP_MODEL and GEMINI_BACKUP_MODEL != GEMINI_MODEL:
-        models.append(GEMINI_BACKUP_MODEL)
-
     last_error = None
+    models = get_models()
 
     for index, model_name in enumerate(models):
-        try:
-            logger.info("Starting stream with: %s", model_name)
+        received_text = False
 
+        try:
             stream = client.models.generate_content_stream(
                 model=model_name,
                 contents=contents,
-                config=generation_config()
+                config=generation_config(numerical)
             )
-
-            received_text = False
 
             for chunk in stream:
                 chunk_text = getattr(chunk, "text", None)
@@ -304,442 +802,19 @@ def stream_with_fallback(contents):
             logger.warning(
                 "Streaming failed for %s: %s",
                 model_name,
-                str(error)[:300]
+                str(error)[:250]
             )
 
-            # Do not restart from the backup after showing
-            # part of an answer, because that could duplicate text.
             if received_text:
                 raise RuntimeError(
-                    "The response stream stopped unexpectedly. "
-                    "Please try again."
+                    "The response stream stopped unexpectedly."
                 )
 
             if not is_temporary_error(error):
                 break
 
             if index < len(models) - 1:
-                time.sleep(0.3)
+                time.sleep(0.2)
 
     raise RuntimeError(
-        "Alpha is temporarily unable to answer. "
-        "Please try again shortly. Details: "
-        + str(last_error)[:300]
-    )
-
-
-# ============================================================
-# CHAT
-# ============================================================
-
-def convert_history(history, current_message):
-    contents = []
-
-    for item in (history or [])[-8:]:
-        if not isinstance(item, dict):
-            continue
-
-        role = item.get("role")
-        content = item.get("content")
-
-        if role not in ("user", "assistant") or not isinstance(content, str):
-            continue
-
-        contents.append(
-            types.Content(
-                role="user" if role == "user" else "model",
-                parts=[types.Part(text=content)]
-            )
-        )
-
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[types.Part(text=current_message)]
-        )
-    )
-
-    return contents
-
-
-def chat(message, history):
-    history = list(history or [])
-
-    if not message or not message.strip():
-        yield history, ""
-        return
-
-    message = message.strip()
-
-    # FIRST: Try local calculation.
-    # This avoids a Gemini API request for simple arithmetic.
-    local_answer = calculate_locally(message)
-
-    if local_answer is not None:
-        history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": local_answer})
-        yield history, ""
-        return
-
-    history.append({"role": "user", "content": message})
-
-    try:
-        contents = convert_history(history[:-1], message)
-
-        # Display an empty assistant message, then update it
-        # as Gemini streams tokens.
-        history.append({"role": "assistant", "content": ""})
-
-        answer = ""
-
-        for part in stream_with_fallback(contents):
-            answer += part
-            history[-1]["content"] = answer
-            yield history, ""
-
-    except Exception as error:
-        logger.exception("Chat error")
-
-        error_message = (
-            "Sorry, Alpha could not complete this request. "
-            + str(error)
-        )
-
-        if history and history[-1].get("role") == "assistant":
-            history[-1]["content"] = error_message
-        else:
-            history.append({
-                "role": "assistant",
-                "content": error_message
-            })
-
-        yield history, ""
-
-
-# ============================================================
-# IMAGE GENERATION - CLOUDFLARE FLUX
-# ============================================================
-
-def generate_image(prompt):
-    if not prompt or not prompt.strip():
-        raise gr.Error("Please enter an image prompt.")
-
-    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        raise gr.Error(
-            "Image generation is not configured. "
-            "Check your Cloudflare environment variables."
-        )
-
-    endpoint = (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        + CLOUDFLARE_ACCOUNT_ID
-        + "/ai/run/"
-        + IMAGE_MODEL
-    )
-
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "prompt": prompt.strip(),
-        "num_steps": 4
-    }
-
-    try:
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            json=payload,
-            timeout=90
-        )
-
-        if response.status_code != 200:
-            raise gr.Error(
-                "Image provider error: "
-                + response.text[:500]
-            )
-
-        content_type = response.headers.get("content-type", "")
-
-        if "image/" in content_type:
-            image_bytes = response.content
-        else:
-            data = response.json()
-
-            if not data.get("success", True):
-                raise gr.Error(str(data.get("errors", data))[:500])
-
-            result = data.get("result", {})
-            encoded_image = result.get("image")
-
-            if not encoded_image:
-                raise gr.Error("The image provider returned no image.")
-
-            image_bytes = base64.b64decode(encoded_image)
-
-        output_path = os.path.join(
-            tempfile.gettempdir(),
-            f"alpha_image_{int(time.time() * 1000)}.png"
-        )
-
-        with open(output_path, "wb") as file:
-            file.write(image_bytes)
-
-        # Verify that the returned file is a valid image.
-        with Image.open(output_path) as generated:
-            generated.verify()
-
-        return output_path
-
-    except gr.Error:
-        raise
-    except Exception as error:
-        logger.exception("Image generation error")
-        raise gr.Error("Image generation failed: " + str(error)[:300])
-
-
-# ============================================================
-# IMAGE ANALYSIS
-# ============================================================
-
-def analyze_image(image, question):
-    if image is None:
-        raise gr.Error("Please upload an image.")
-
-    prompt = (question or "").strip()
-
-    if not prompt:
-        prompt = "Describe this image clearly and accurately."
-
-    try:
-        contents = [
-            image,
-            prompt
-        ]
-
-        return generate_with_fallback(contents)
-
-    except Exception as error:
-        logger.exception("Image analysis error")
-        raise gr.Error("Image analysis failed: " + str(error)[:400])
-
-
-# ============================================================
-# VIDEO ANALYSIS
-# ============================================================
-
-def analyze_video(video_path, question):
-    if not video_path:
-        raise gr.Error("Please upload a video.")
-
-    prompt = (question or "").strip()
-
-    if not prompt:
-        prompt = "Summarize this video and explain what happens."
-
-    try:
-        check_client()
-
-        uploaded_file = client.files.upload(file=video_path)
-
-        # Wait for video processing when the API reports
-        # that the uploaded file is still processing.
-        for _ in range(30):
-            state = getattr(uploaded_file, "state", None)
-            state_name = str(state).upper()
-
-            if "ACTIVE" in state_name:
-                break
-
-            if "FAILED" in state_name:
-                raise RuntimeError("Google could not process this video.")
-
-            time.sleep(1)
-
-            uploaded_file = client.files.get(
-                name=uploaded_file.name
-            )
-
-        contents = [
-            uploaded_file,
-            prompt
-        ]
-
-        return generate_with_fallback(contents)
-
-    except Exception as error:
-        logger.exception("Video analysis error")
-        raise gr.Error("Video analysis failed: " + str(error)[:400])
-
-
-# ============================================================
-# GRADIO INTERFACE
-# ============================================================
-
-CUSTOM_CSS = """
-.gradio-container {
-    max-width: 1100px !important;
-    margin: auto !important;
-}
-"""
-
-with gr.Blocks(
-    title="Alpha AI",
-    theme=gr.themes.Soft(),
-    css=CUSTOM_CSS
-) as demo:
-
-    gr.Markdown(
-        """
-        # Alpha AI
-        ### Think Beyond Limits.
-        """
-    )
-
-    with gr.Tab("Chat"):
-        chatbot = gr.Chatbot(
-            height=520,
-            label="Alpha Chat"
-        )
-
-        with gr.Row():
-            message = gr.Textbox(
-                placeholder="Ask Alpha anything...",
-                show_label=False,
-                scale=8,
-                lines=1
-            )
-
-            send_button = gr.Button(
-                "Send",
-                variant="primary",
-                scale=1
-            )
-
-        clear_button = gr.Button("Clear chat")
-
-        message.submit(
-            chat,
-            inputs=[message, chatbot],
-            outputs=[chatbot, message]
-        )
-
-        send_button.click(
-            chat,
-            inputs=[message, chatbot],
-            outputs=[chatbot, message]
-        )
-
-        clear_button.click(
-            lambda: ([], ""),
-            outputs=[chatbot, message]
-        )
-
-    with gr.Tab("Image Studio"):
-        gr.Markdown("### Create an image with Alpha")
-
-        image_prompt = gr.Textbox(
-            label="Image prompt",
-            placeholder="Describe the image you want..."
-        )
-
-        generate_button = gr.Button(
-            "Generate Image",
-            variant="primary"
-        )
-
-        generated_image = gr.Image(
-            label="Generated image",
-            type="filepath"
-        )
-
-        download_file = gr.File(
-            label="Download generated image"
-        )
-
-        generate_button.click(
-            generate_image,
-            inputs=image_prompt,
-            outputs=[generated_image, download_file]
-        ).then(
-            lambda path: path,
-            inputs=generated_image,
-            outputs=download_file
-        )
-
-    with gr.Tab("Image Analysis"):
-        gr.Markdown("### Ask questions about an image")
-
-        uploaded_image = gr.Image(
-            label="Upload image",
-            type="pil"
-        )
-
-        image_question = gr.Textbox(
-            label="Your question",
-            placeholder="What is happening in this image?"
-        )
-
-        analyze_image_button = gr.Button(
-            "Analyze Image",
-            variant="primary"
-        )
-
-        image_result = gr.Markdown()
-
-        analyze_image_button.click(
-            analyze_image,
-            inputs=[uploaded_image, image_question],
-            outputs=image_result
-        )
-
-    with gr.Tab("Video Analysis"):
-        gr.Markdown("### Understand a video with Alpha")
-
-        uploaded_video = gr.Video(
-            label="Upload video"
-        )
-
-        video_question = gr.Textbox(
-            label="Your question",
-            placeholder="Summarize this video..."
-        )
-
-        analyze_video_button = gr.Button(
-            "Analyze Video",
-            variant="primary"
-        )
-
-        video_result = gr.Markdown()
-
-        analyze_video_button.click(
-            analyze_video,
-            inputs=[uploaded_video, video_question],
-            outputs=video_result
-        )
-
-    gr.Markdown(
-        """
-        ---
-        **Alpha AI** · Think Beyond Limits.
-        """
-    )
-
-
-# ============================================================
-# START SERVER
-# ============================================================
-
-if __name__ == "__main__":
-    demo.queue(
-        default_concurrency_limit=4,
-        max_size=30
-    )
-
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=PORT
-                   )
-    
+        
