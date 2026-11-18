@@ -12,9 +12,10 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# =========================
+
+# ==========================================
 # ALPHA AI CONFIGURATION
-# =========================
+# ==========================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alpha")
@@ -22,7 +23,16 @@ logger = logging.getLogger("alpha")
 PORT = int(os.getenv("PORT", "10000"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
+
+GEMINI_BACKUP_MODEL = os.getenv(
+    "GEMINI_BACKUP_MODEL",
+    "gemini-3.5-flash-lite"
+)
 
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
@@ -35,11 +45,17 @@ IMAGE_MODEL = os.getenv(
 client = None
 
 
+# ==========================================
+# GEMINI CLIENT
+# ==========================================
+
 def get_client():
     global client
 
     if not GEMINI_API_KEY:
-        raise gr.Error("GEMINI_API_KEY is missing in Render Environment.")
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing in Render Environment."
+        )
 
     if client is None:
         client = genai.Client(api_key=GEMINI_API_KEY)
@@ -47,11 +63,159 @@ def get_client():
     return client
 
 
-# =========================
+# ==========================================
+# ERROR DETECTION
+# ==========================================
+
+def is_temporary_error(error):
+    message = str(error).upper()
+
+    temporary_codes = [
+        "503",
+        "UNAVAILABLE",
+        "500",
+        "502",
+        "504",
+        "RESOURCE EXHAUSTED",
+        "INTERNAL SERVER ERROR",
+        "SERVICE UNAVAILABLE",
+        "BAD GATEWAY",
+        "GATEWAY TIMEOUT"
+    ]
+
+    return any(code in message for code in temporary_codes)
+
+
+# ==========================================
+# NON-STREAMING MODEL FALLBACK
+# ==========================================
+
+def generate_with_fallback(contents, config):
+    ai = get_client()
+
+    models = [GEMINI_MODEL]
+
+    if GEMINI_BACKUP_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_BACKUP_MODEL)
+
+    last_error = None
+
+    for model in models:
+
+        for attempt in range(2):
+
+            try:
+                logger.info(
+                    "Trying Gemini model %s, attempt %s",
+                    model,
+                    attempt + 1
+                )
+
+                response = ai.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+
+                return response
+
+            except Exception as error:
+                last_error = error
+
+                logger.warning(
+                    "Model %s failed: %s",
+                    model,
+                    error
+                )
+
+                if not is_temporary_error(error):
+                    raise
+
+                if attempt == 0:
+                    time.sleep(2)
+
+    raise RuntimeError(
+        "Primary and backup Gemini models are unavailable. "
+        + str(last_error)
+    )
+
+
+# ==========================================
+# STREAMING CHAT WITH FALLBACK
+# ==========================================
+
+def stream_chat_with_fallback(contents, config):
+    ai = get_client()
+
+    models = [GEMINI_MODEL]
+
+    if GEMINI_BACKUP_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_BACKUP_MODEL)
+
+    last_error = None
+
+    for model in models:
+
+        for attempt in range(2):
+
+            answer = ""
+
+            try:
+                logger.info(
+                    "Chat using %s, attempt %s",
+                    model,
+                    attempt + 1
+                )
+
+                stream = ai.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+
+                for chunk in stream:
+                    if chunk.text:
+                        answer += chunk.text
+                        yield answer
+
+                if answer:
+                    return
+
+                raise RuntimeError(
+                    "Gemini returned an empty response."
+                )
+
+            except Exception as error:
+                last_error = error
+
+                logger.warning(
+                    "Chat failed on %s: %s",
+                    model,
+                    error
+                )
+
+                if not is_temporary_error(error):
+                    raise
+
+                # Clear any partial answer before retrying.
+                if answer:
+                    yield ""
+
+                if attempt == 0:
+                    time.sleep(2)
+
+    raise RuntimeError(
+        "Both Gemini models are unavailable. "
+        + str(last_error)
+    )
+
+
+# ==========================================
 # GEMINI CHAT
-# =========================
+# ==========================================
 
 def chat(message, history):
+
     message = (message or "").strip()
     history = list(history or [])
 
@@ -74,8 +238,9 @@ def chat(message, history):
     try:
         contents = []
 
-        # Keep recent conversation context.
+        # Include recent conversation context.
         for item in history[:-2][-12:]:
+
             role = item.get("role")
             content = item.get("content")
 
@@ -92,6 +257,7 @@ def chat(message, history):
                 )
             )
 
+        # Add current message.
         contents.append(
             types.Content(
                 role="user",
@@ -99,51 +265,44 @@ def chat(message, history):
             )
         )
 
-        stream = get_client().models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=1024
-            )
+        config = types.GenerateContentConfig(
+            max_output_tokens=1024
         )
 
-        answer = ""
+        for answer in stream_chat_with_fallback(
+            contents,
+            config
+        ):
 
-        for chunk in stream:
-            if chunk.text:
-                answer += chunk.text
-                history[answer_index]["content"] = answer
-                yield history
-
-        if not answer:
-            history[answer_index]["content"] = (
-                "Alpha could not generate a response. Please try again."
-            )
+            history[answer_index]["content"] = answer
             yield history
 
-    except Exception as e:
+    except Exception:
         logger.exception("Chat error")
 
         history[answer_index]["content"] = (
-            f"Alpha error: {str(e)}"
+            "Alpha is temporarily unable to answer. "
+            "Please try again shortly."
         )
 
         yield history
 
 
-# =========================
+# ==========================================
 # IMAGE GENERATION
-# =========================
+# ==========================================
 
 def generate_image(prompt):
+
     prompt = (prompt or "").strip()
 
     if not prompt:
         raise gr.Error("Enter an image description.")
 
     if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        raise gr.Error("Cloudflare environment variables are missing.")
+        raise gr.Error(
+            "Cloudflare environment variables are missing."
+        )
 
     url = (
         "https://api.cloudflare.com/client/v4/accounts/"
@@ -159,24 +318,35 @@ def generate_image(prompt):
                 "Authorization": "Bearer " + CLOUDFLARE_API_TOKEN,
                 "Content-Type": "application/json"
             },
-            json={"prompt": prompt},
+            json={
+                "prompt": prompt
+            },
             timeout=90
         )
 
         response.raise_for_status()
 
-        if "image/" in response.headers.get("content-type", ""):
+        if "image/" in response.headers.get(
+            "content-type", ""
+        ):
             image_bytes = response.content
+
         else:
             data = response.json()
-            encoded = data.get("result", {}).get("image")
+
+            encoded = data.get(
+                "result", {}
+            ).get("image")
 
             if not encoded:
                 raise RuntimeError(str(data))
 
             image_bytes = base64.b64decode(encoded)
 
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        ).convert("RGB")
+
         image.thumbnail((1280, 720))
 
         file = tempfile.NamedTemporaryFile(
@@ -189,24 +359,31 @@ def generate_image(prompt):
 
         return file.name
 
-    except Exception as e:
+    except Exception as error:
         logger.exception("Image generation error")
-        raise gr.Error(f"Image generation failed: {e}")
+
+        raise gr.Error(
+            f"Image generation failed: {error}"
+        )
 
 
-# =========================
+# ==========================================
 # IMAGE ANALYSIS
-# =========================
+# ==========================================
 
 def analyze_image(image_path, question):
+
     if not image_path:
         raise gr.Error("Upload an image first.")
 
-    question = (question or "").strip() or "Describe this image."
+    question = (
+        (question or "").strip()
+        or "Describe this image."
+    )
 
     try:
-        with open(image_path, "rb") as f:
-            image_bytes = f.read()
+        with open(image_path, "rb") as file:
+            image_bytes = file.read()
 
         extension = image_path.lower()
 
@@ -214,40 +391,47 @@ def analyze_image(image_path, question):
 
         if extension.endswith(".png"):
             mime_type = "image/png"
+
         elif extension.endswith(".webp"):
             mime_type = "image/webp"
 
-        response = get_client().models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type=mime_type
-                ),
-                types.Part(text=question)
-            ],
-            config=types.GenerateContentConfig(
+        contents = [
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=mime_type
+            ),
+            types.Part(text=question)
+        ]
+
+        response = generate_with_fallback(
+            contents,
+            types.GenerateContentConfig(
                 max_output_tokens=1200
             )
         )
 
         return response.text or "No answer received."
 
-    except Exception as e:
+    except Exception as error:
         logger.exception("Image analysis error")
-        raise gr.Error(f"Image analysis failed: {e}")
+
+        raise gr.Error(
+            f"Image analysis failed: {error}"
+        )
 
 
-# =========================
+# ==========================================
 # VIDEO ANALYSIS
-# =========================
+# ==========================================
 
 def analyze_video(video_path, question):
+
     if not video_path:
         raise gr.Error("Upload a video first.")
 
-    question = (question or "").strip() or (
-        "Summarize this video and explain its main events."
+    question = (
+        (question or "").strip()
+        or "Summarize this video and explain its main events."
     )
 
     uploaded = None
@@ -255,7 +439,9 @@ def analyze_video(video_path, question):
     try:
         ai = get_client()
 
-        uploaded = ai.files.upload(file=video_path)
+        uploaded = ai.files.upload(
+            file=video_path
+        )
 
         deadline = time.time() + 180
 
@@ -263,30 +449,43 @@ def analyze_video(video_path, question):
             uploaded.state
             and str(uploaded.state).upper().endswith("PROCESSING")
         ):
+
             if time.time() > deadline:
-                raise TimeoutError("Video processing timed out.")
+                raise TimeoutError(
+                    "Video processing timed out."
+                )
 
             time.sleep(2)
-            uploaded = ai.files.get(name=uploaded.name)
 
-        response = ai.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[uploaded, question],
-            config=types.GenerateContentConfig(
+            uploaded = ai.files.get(
+                name=uploaded.name
+            )
+
+        contents = [
+            uploaded,
+            question
+        ]
+
+        response = generate_with_fallback(
+            contents,
+            types.GenerateContentConfig(
                 max_output_tokens=1500
             )
         )
 
         return response.text or "No answer received."
 
-    except Exception as e:
+    except Exception as error:
         logger.exception("Video analysis error")
-        raise gr.Error(f"Video analysis failed: {e}")
+
+        raise gr.Error(
+            f"Video analysis failed: {error}"
+        )
 
 
-# =========================
+# ==========================================
 # ALPHA INTERFACE
-# =========================
+# ==========================================
 
 CSS = """
 .gradio-container {
@@ -294,6 +493,7 @@ CSS = """
     margin: auto !important;
 }
 """
+
 
 with gr.Blocks(
     title="Alpha AI",
@@ -306,7 +506,10 @@ with gr.Blocks(
 
     with gr.Tabs():
 
+        # ----------------------------------
         # CHAT
+        # ----------------------------------
+
         with gr.Tab("Chat"):
 
             chatbot = gr.Chatbot(
@@ -315,6 +518,7 @@ with gr.Blocks(
             )
 
             with gr.Row():
+
                 message = gr.Textbox(
                     placeholder="Ask Alpha anything...",
                     label="Message",
@@ -345,7 +549,10 @@ with gr.Blocks(
                 outputs=chatbot
             )
 
+        # ----------------------------------
         # IMAGE GENERATION
+        # ----------------------------------
+
         with gr.Tab("Image Studio"):
 
             prompt = gr.Textbox(
@@ -369,7 +576,10 @@ with gr.Blocks(
                 outputs=generated
             )
 
+        # ----------------------------------
         # IMAGE ANALYSIS
+        # ----------------------------------
+
         with gr.Tab("Image Analysis"):
 
             image = gr.Image(
@@ -395,7 +605,10 @@ with gr.Blocks(
                 outputs=image_result
             )
 
+        # ----------------------------------
         # VIDEO ANALYSIS
+        # ----------------------------------
+
         with gr.Tab("Video Analysis"):
 
             video = gr.Video(
@@ -422,15 +635,18 @@ with gr.Blocks(
             )
 
 
-# =========================
+# ==========================================
 # RENDER STARTUP
-# =========================
+# ==========================================
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=2)
+
+    demo.queue(
+        default_concurrency_limit=2
+    )
 
     demo.launch(
         server_name="0.0.0.0",
         server_port=PORT
-        )
-    
+                )
+            
