@@ -24,7 +24,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 IMAGE_MODEL = os.environ.get(
     "IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
 )
