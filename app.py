@@ -1,10 +1,13 @@
 
 import os
-import io
+import re
+import ast
 import time
 import base64
-import logging
+import operator
 import tempfile
+import logging
+from pathlib import Path
 
 import gradio as gr
 import requests
@@ -13,721 +16,730 @@ from google import genai
 from google.genai import types
 
 
-# ==========================================
-# ALPHA AI CONFIGURATION
-# ==========================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alpha")
 
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "10000"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
-
-GEMINI_BACKUP_MODEL = os.getenv(
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_BACKUP_MODEL = os.environ.get(
     "GEMINI_BACKUP_MODEL",
     "gemini-3.5-flash-lite"
 )
 
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
-IMAGE_MODEL = os.getenv(
+IMAGE_MODEL = os.environ.get(
     "IMAGE_MODEL",
     "@cf/black-forest-labs/flux-1-schnell"
 )
 
+SYSTEM_PROMPT = """
+You are Alpha, a helpful AI assistant.
+
+Rules:
+- Answer clearly and accurately.
+- Use simple language when appropriate.
+- Give the direct answer first.
+- Avoid unnecessary introductions and repetition.
+- For educational questions, explain step by step when useful.
+- If you are uncertain, say so instead of inventing facts.
+- Keep simple answers concise.
+"""
+
+# Create one reusable client instead of creating a new one
+# for every question.
 client = None
 
-
-# ==========================================
-# GEMINI CLIENT
-# ==========================================
-
-def get_client():
-    global client
-
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing in Render Environment."
-        )
-
-    if client is None:
+if GEMINI_API_KEY:
+    try:
         client = genai.Client(
             api_key=GEMINI_API_KEY,
-            http_options=types.HttpOptions(
-                timeout=90000
-            )
+            http_options=types.HttpOptions(timeout=45000)
+        )
+    except Exception:
+        logger.exception("Could not initialize Gemini client")
+
+
+# ============================================================
+# LOCAL MATH ENGINE
+# ============================================================
+
+MATH_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def safe_math_node(node):
+    if isinstance(node, ast.Expression):
+        return safe_math_node(node.body)
+
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)) and not isinstance(
+            node.value, bool
+        ):
+            return node.value
+        raise ValueError("Invalid number")
+
+    if isinstance(node, ast.UnaryOp):
+        operation = MATH_OPERATORS.get(type(node.op))
+        if operation is None:
+            raise ValueError("Invalid operation")
+        return operation(safe_math_node(node.operand))
+
+    if isinstance(node, ast.BinOp):
+        operation = MATH_OPERATORS.get(type(node.op))
+        if operation is None:
+            raise ValueError("Invalid operation")
+
+        left = safe_math_node(node.left)
+        right = safe_math_node(node.right)
+
+        # Prevent excessively large exponent calculations.
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 10 or abs(left) > 100000:
+                raise ValueError("Calculation too large")
+
+        result = operation(left, right)
+
+        if isinstance(result, complex):
+            raise ValueError("Invalid result")
+
+        if abs(result) > 10**100:
+            raise ValueError("Result too large")
+
+        return result
+
+    raise ValueError("Unsupported expression")
+
+
+def extract_math_expression(message):
+    text = message.strip().lower()
+
+    # Direct expression, for example: 12 - 9
+    if re.fullmatch(r"[\d\s.+\-*/()%]+", text):
+        return text
+
+    # Natural-language expression, for example:
+    # "what is 12 - 9?"
+    patterns = [
+        r"^(?:what is|calculate|solve|compute)\s+(.+?)\??$",
+        r"^(?:please calculate|please solve)\s+(.+?)\??$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, text)
+        if match:
+            expression = match.group(1).strip()
+            if re.fullmatch(r"[\d\s.+\-*/()%]+", expression):
+                return expression
+
+    return None
+
+
+def calculate_locally(message):
+    expression = extract_math_expression(message)
+
+    if not expression:
+        return None
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+        result = safe_math_node(tree)
+
+        if isinstance(result, float):
+            if result.is_integer():
+                return str(int(result))
+            return str(round(result, 10))
+
+        return str(result)
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# GEMINI GENERATION
+# ============================================================
+
+def check_client():
+    if client is None:
+        raise RuntimeError(
+            "Gemini is not configured. Check GEMINI_API_KEY in Render."
         )
 
-    return client
-
-
-# ==========================================
-# FAST MODEL CONFIGURATION
-# ==========================================
-
-def get_generation_config(max_tokens=1024):
-    return types.GenerateContentConfig(
-        max_output_tokens=max_tokens,
-        thinking_config=types.ThinkingConfig(
-            thinking_level="low"
-        )
-    )
-
-
-# ==========================================
-# ERROR DETECTION
-# ==========================================
 
 def is_temporary_error(error):
     message = str(error).upper()
 
-    codes = [
+    indicators = [
         "503",
         "UNAVAILABLE",
+        "429",
+        "RESOURCE_EXHAUSTED",
         "500",
         "502",
         "504",
-        "RESOURCE EXHAUSTED",
-        "SERVICE UNAVAILABLE",
-        "INTERNAL SERVER ERROR",
-        "BAD GATEWAY",
-        "GATEWAY TIMEOUT",
-        "429"
+        "TIMEOUT",
+        "INTERNAL"
     ]
 
-    return any(code in message for code in codes)
+    return any(item in message for item in indicators)
 
 
-# ==========================================
-# MODEL LIST
-# ==========================================
+def generation_config():
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=900
+    )
 
-def get_models():
+
+def generate_with_fallback(contents):
+    """
+    Try the primary model first.
+    Use the backup model if the primary has a temporary failure.
+    """
+
+    check_client()
+
     models = [GEMINI_MODEL]
 
-    if GEMINI_BACKUP_MODEL != GEMINI_MODEL:
+    if GEMINI_BACKUP_MODEL and GEMINI_BACKUP_MODEL != GEMINI_MODEL:
         models.append(GEMINI_BACKUP_MODEL)
 
-    return models
-
-
-# ==========================================
-# NON-STREAMING FALLBACK
-# ==========================================
-
-def generate_with_fallback(contents, config=None):
-
-    ai = get_client()
     last_error = None
 
-    if config is None:
-        config = get_generation_config()
-
-    for model in get_models():
-
+    for index, model_name in enumerate(models):
         try:
-            logger.info("Trying Gemini model: %s", model)
+            logger.info("Trying Gemini model: %s", model_name)
 
-            response = ai.models.generate_content(
-                model=model,
+            response = client.models.generate_content(
+                model=model_name,
                 contents=contents,
-                config=config
+                config=generation_config()
             )
 
-            logger.info("Gemini response received from %s", model)
+            if response and response.text:
+                return response.text
 
-            return response
+            raise RuntimeError("Gemini returned an empty response.")
 
         except Exception as error:
             last_error = error
-
-            logger.exception(
-                "Gemini model %s failed",
-                model
+            logger.warning(
+                "Model %s failed: %s",
+                model_name,
+                str(error)[:300]
             )
 
             if not is_temporary_error(error):
-                raise
+                break
 
-            logger.warning(
-                "Switching to next available model."
-            )
+            if index < len(models) - 1:
+                time.sleep(0.3)
 
     raise RuntimeError(
-        "All Gemini models failed. Last error: "
-        + str(last_error)
+        "Alpha could not get a response from Gemini. "
+        "Please try again shortly. Details: "
+        + str(last_error)[:300]
     )
 
 
-# ==========================================
-# STREAMING CHAT WITH BACKUP
-# ==========================================
+def stream_with_fallback(contents):
+    """
+    Stream the answer from the primary model.
+    If the stream fails before producing text, try the backup.
+    """
 
-def stream_chat_with_fallback(contents, config):
+    check_client()
 
-    ai = get_client()
+    models = [GEMINI_MODEL]
+
+    if GEMINI_BACKUP_MODEL and GEMINI_BACKUP_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_BACKUP_MODEL)
+
     last_error = None
 
-    for model in get_models():
-
-        answer = ""
-
+    for index, model_name in enumerate(models):
         try:
-            logger.info("Starting chat with model: %s", model)
+            logger.info("Starting stream with: %s", model_name)
 
-            stream = ai.models.generate_content_stream(
-                model=model,
+            stream = client.models.generate_content_stream(
+                model=model_name,
                 contents=contents,
-                config=config
+                config=generation_config()
             )
+
+            received_text = False
 
             for chunk in stream:
+                chunk_text = getattr(chunk, "text", None)
 
-                if chunk.text:
-                    answer += chunk.text
-                    yield answer
+                if chunk_text:
+                    received_text = True
+                    yield chunk_text
 
-            if answer:
-                logger.info(
-                    "Chat completed using %s",
-                    model
-                )
-                return
+            if not received_text:
+                raise RuntimeError("Empty streaming response.")
 
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
+            return
 
         except Exception as error:
-
             last_error = error
 
-            logger.exception(
-                "Streaming failed using %s",
-                model
+            logger.warning(
+                "Streaming failed for %s: %s",
+                model_name,
+                str(error)[:300]
             )
+
+            # Do not restart from the backup after showing
+            # part of an answer, because that could duplicate text.
+            if received_text:
+                raise RuntimeError(
+                    "The response stream stopped unexpectedly. "
+                    "Please try again."
+                )
 
             if not is_temporary_error(error):
-                raise
+                break
 
-            # Clear incomplete primary response.
-            if answer:
-                yield ""
-
-            logger.warning(
-                "Trying backup model after temporary failure."
-            )
+            if index < len(models) - 1:
+                time.sleep(0.3)
 
     raise RuntimeError(
-        "All Gemini models are unavailable. "
-        + str(last_error)
+        "Alpha is temporarily unable to answer. "
+        "Please try again shortly. Details: "
+        + str(last_error)[:300]
     )
 
 
-# ==========================================
+# ============================================================
 # CHAT
-# ==========================================
+# ============================================================
 
-def chat(message, history):
+def convert_history(history, current_message):
+    contents = []
 
-    message = (message or "").strip()
-    history = list(history or [])
+    for item in (history or [])[-8:]:
+        if not isinstance(item, dict):
+            continue
 
-    if not message:
-        yield history
-        return
+        role = item.get("role")
+        content = item.get("content")
 
-    history.append({
-        "role": "user",
-        "content": message
-    })
-
-    history.append({
-        "role": "assistant",
-        "content": ""
-    })
-
-    answer_index = len(history) - 1
-
-    try:
-
-        contents = []
-
-        # Keep the latest 6 messages as context.
-        previous_messages = history[:-2][-6:]
-
-        for item in previous_messages:
-
-            role = item.get("role")
-            content = item.get("content")
-
-            if role not in ("user", "assistant"):
-                continue
-
-            if not isinstance(content, str) or not content:
-                continue
-
-            contents.append(
-                types.Content(
-                    role=(
-                        "user"
-                        if role == "user"
-                        else "model"
-                    ),
-                    parts=[
-                        types.Part(text=content)
-                    ]
-                )
-            )
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
 
         contents.append(
             types.Content(
-                role="user",
-                parts=[
-                    types.Part(text=message)
-                ]
+                role="user" if role == "user" else "model",
+                parts=[types.Part(text=content)]
             )
         )
 
-        config = get_generation_config(
-            max_tokens=1024
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part(text=current_message)]
+        )
+    )
+
+    return contents
+
+
+def chat(message, history):
+    history = list(history or [])
+
+    if not message or not message.strip():
+        yield history, ""
+        return
+
+    message = message.strip()
+
+    # FIRST: Try local calculation.
+    # This avoids a Gemini API request for simple arithmetic.
+    local_answer = calculate_locally(message)
+
+    if local_answer is not None:
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": local_answer})
+        yield history, ""
+        return
+
+    history.append({"role": "user", "content": message})
+
+    try:
+        contents = convert_history(history[:-1], message)
+
+        # Display an empty assistant message, then update it
+        # as Gemini streams tokens.
+        history.append({"role": "assistant", "content": ""})
+
+        answer = ""
+
+        for part in stream_with_fallback(contents):
+            answer += part
+            history[-1]["content"] = answer
+            yield history, ""
+
+    except Exception as error:
+        logger.exception("Chat error")
+
+        error_message = (
+            "Sorry, Alpha could not complete this request. "
+            + str(error)
         )
 
-        for answer in stream_chat_with_fallback(
-            contents,
-            config
-        ):
+        if history and history[-1].get("role") == "assistant":
+            history[-1]["content"] = error_message
+        else:
+            history.append({
+                "role": "assistant",
+                "content": error_message
+            })
 
-            history[answer_index]["content"] = answer
-            yield history
-
-    except Exception:
-        logger.exception("Alpha chat error")
-
-        history[answer_index]["content"] = (
-            "Alpha is temporarily unable to answer. "
-            "Please try again shortly."
-        )
-
-        yield history
+        yield history, ""
 
 
-# ==========================================
-# IMAGE GENERATION
-# ==========================================
+# ============================================================
+# IMAGE GENERATION - CLOUDFLARE FLUX
+# ============================================================
 
 def generate_image(prompt):
+    if not prompt or not prompt.strip():
+        raise gr.Error("Please enter an image prompt.")
 
-    prompt = (prompt or "").strip()
-
-    if not prompt:
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
         raise gr.Error(
-            "Please enter an image description."
+            "Image generation is not configured. "
+            "Check your Cloudflare environment variables."
         )
 
-    if not CLOUDFLARE_API_TOKEN:
-        raise gr.Error(
-            "Cloudflare API token is missing."
-        )
-
-    if not CLOUDFLARE_ACCOUNT_ID:
-        raise gr.Error(
-            "Cloudflare account ID is missing."
-        )
-
-    url = (
+    endpoint = (
         "https://api.cloudflare.com/client/v4/accounts/"
         + CLOUDFLARE_ACCOUNT_ID
         + "/ai/run/"
         + IMAGE_MODEL
     )
 
-    try:
+    headers = {
+        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
+    payload = {
+        "prompt": prompt.strip(),
+        "num_steps": 4
+    }
+
+    try:
         response = requests.post(
-            url,
-            headers={
-                "Authorization": (
-                    "Bearer " + CLOUDFLARE_API_TOKEN
-                ),
-                "Content-Type": "application/json"
-            },
-            json={
-                "prompt": prompt
-            },
+            endpoint,
+            headers=headers,
+            json=payload,
             timeout=90
         )
 
-        response.raise_for_status()
+        if response.status_code != 200:
+            raise gr.Error(
+                "Image provider error: "
+                + response.text[:500]
+            )
 
-        content_type = response.headers.get(
-            "content-type",
-            ""
-        )
+        content_type = response.headers.get("content-type", "")
 
         if "image/" in content_type:
-
             image_bytes = response.content
-
         else:
-
             data = response.json()
 
-            encoded = data.get(
-                "result", {}
-            ).get("image")
+            if not data.get("success", True):
+                raise gr.Error(str(data.get("errors", data))[:500])
 
-            if not encoded:
-                raise RuntimeError(str(data))
+            result = data.get("result", {})
+            encoded_image = result.get("image")
 
-            image_bytes = base64.b64decode(
-                encoded
-            )
+            if not encoded_image:
+                raise gr.Error("The image provider returned no image.")
 
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        ).convert("RGB")
+            image_bytes = base64.b64decode(encoded_image)
 
-        image.thumbnail((1280, 720))
-
-        file = tempfile.NamedTemporaryFile(
-            suffix=".png",
-            delete=False
+        output_path = os.path.join(
+            tempfile.gettempdir(),
+            f"alpha_image_{int(time.time() * 1000)}.png"
         )
 
-        image.save(
-            file.name,
-            format="PNG"
-        )
+        with open(output_path, "wb") as file:
+            file.write(image_bytes)
 
-        file.close()
+        # Verify that the returned file is a valid image.
+        with Image.open(output_path) as generated:
+            generated.verify()
 
-        return file.name
+        return output_path
 
+    except gr.Error:
+        raise
     except Exception as error:
-
-        logger.exception(
-            "Image generation error"
-        )
-
-        raise gr.Error(
-            f"Image generation failed: {error}"
-        )
+        logger.exception("Image generation error")
+        raise gr.Error("Image generation failed: " + str(error)[:300])
 
 
-# ==========================================
+# ============================================================
 # IMAGE ANALYSIS
-# ==========================================
+# ============================================================
 
-def analyze_image(image_path, question):
+def analyze_image(image, question):
+    if image is None:
+        raise gr.Error("Please upload an image.")
 
-    if not image_path:
-        raise gr.Error(
-            "Upload an image first."
-        )
+    prompt = (question or "").strip()
 
-    question = (
-        (question or "").strip()
-        or "Describe this image."
-    )
+    if not prompt:
+        prompt = "Describe this image clearly and accurately."
 
     try:
-
-        with open(image_path, "rb") as file:
-            image_bytes = file.read()
-
-        extension = image_path.lower()
-
-        mime_type = "image/jpeg"
-
-        if extension.endswith(".png"):
-            mime_type = "image/png"
-
-        elif extension.endswith(".webp"):
-            mime_type = "image/webp"
-
         contents = [
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type
-            ),
-            types.Part(text=question)
+            image,
+            prompt
         ]
 
-        response = generate_with_fallback(
-            contents,
-            get_generation_config(1200)
-        )
-
-        return (
-            response.text
-            or "No answer received."
-        )
+        return generate_with_fallback(contents)
 
     except Exception as error:
-
-        logger.exception(
-            "Image analysis error"
-        )
-
-        raise gr.Error(
-            f"Image analysis failed: {error}"
-        )
+        logger.exception("Image analysis error")
+        raise gr.Error("Image analysis failed: " + str(error)[:400])
 
 
-# ==========================================
+# ============================================================
 # VIDEO ANALYSIS
-# ==========================================
+# ============================================================
 
 def analyze_video(video_path, question):
-
     if not video_path:
-        raise gr.Error(
-            "Upload a video first."
-        )
+        raise gr.Error("Please upload a video.")
 
-    question = (
-        (question or "").strip()
-        or "Summarize this video and explain its main events."
-    )
+    prompt = (question or "").strip()
+
+    if not prompt:
+        prompt = "Summarize this video and explain what happens."
 
     try:
+        check_client()
 
-        ai = get_client()
+        uploaded_file = client.files.upload(file=video_path)
 
-        logger.info("Uploading video to Gemini.")
+        # Wait for video processing when the API reports
+        # that the uploaded file is still processing.
+        for _ in range(30):
+            state = getattr(uploaded_file, "state", None)
+            state_name = str(state).upper()
 
-        uploaded = ai.files.upload(
-            file=video_path
-        )
+            if "ACTIVE" in state_name:
+                break
 
-        deadline = time.time() + 180
+            if "FAILED" in state_name:
+                raise RuntimeError("Google could not process this video.")
 
-        while (
-            uploaded.state
-            and str(uploaded.state).upper().endswith("PROCESSING")
-        ):
+            time.sleep(1)
 
-            if time.time() > deadline:
-                raise TimeoutError(
-                    "Video processing timed out."
-                )
-
-            time.sleep(2)
-
-            uploaded = ai.files.get(
-                name=uploaded.name
+            uploaded_file = client.files.get(
+                name=uploaded_file.name
             )
 
         contents = [
-            uploaded,
-            question
+            uploaded_file,
+            prompt
         ]
 
-        response = generate_with_fallback(
-            contents,
-            get_generation_config(1500)
-        )
-
-        return (
-            response.text
-            or "No answer received."
-        )
+        return generate_with_fallback(contents)
 
     except Exception as error:
-
-        logger.exception(
-            "Video analysis error"
-        )
-
-        raise gr.Error(
-            f"Video analysis failed: {error}"
-        )
+        logger.exception("Video analysis error")
+        raise gr.Error("Video analysis failed: " + str(error)[:400])
 
 
-# ==========================================
-# ALPHA INTERFACE
-# ==========================================
+# ============================================================
+# GRADIO INTERFACE
+# ============================================================
 
-CSS = """
+CUSTOM_CSS = """
 .gradio-container {
     max-width: 1100px !important;
     margin: auto !important;
 }
 """
 
-
 with gr.Blocks(
     title="Alpha AI",
     theme=gr.themes.Soft(),
-    css=CSS
+    css=CUSTOM_CSS
 ) as demo:
 
-    gr.Markdown("# Alpha AI")
-    gr.Markdown("### Think Beyond Limits.")
+    gr.Markdown(
+        """
+        # Alpha AI
+        ### Think Beyond Limits.
+        """
+    )
 
-    with gr.Tabs():
+    with gr.Tab("Chat"):
+        chatbot = gr.Chatbot(
+            height=520,
+            label="Alpha Chat"
+        )
 
-        # ----------------------------------
-        # CHAT
-        # ----------------------------------
-
-        with gr.Tab("Chat"):
-
-            chatbot = gr.Chatbot(
-                label="Alpha Assistant",
-                height=480
+        with gr.Row():
+            message = gr.Textbox(
+                placeholder="Ask Alpha anything...",
+                show_label=False,
+                scale=8,
+                lines=1
             )
 
-            with gr.Row():
-
-                message = gr.Textbox(
-                    placeholder="Ask Alpha anything...",
-                    label="Message",
-                    scale=8
-                )
-
-                send = gr.Button(
-                    "Send",
-                    variant="primary"
-                )
-
-            clear = gr.Button("Clear chat")
-
-            send.click(
-                chat,
-                inputs=[
-                    message,
-                    chatbot
-                ],
-                outputs=chatbot
+            send_button = gr.Button(
+                "Send",
+                variant="primary",
+                scale=1
             )
 
-            message.submit(
-                chat,
-                inputs=[
-                    message,
-                    chatbot
-                ],
-                outputs=chatbot
-            )
+        clear_button = gr.Button("Clear chat")
 
-            clear.click(
-                lambda: [],
-                outputs=chatbot
-            )
+        message.submit(
+            chat,
+            inputs=[message, chatbot],
+            outputs=[chatbot, message]
+        )
 
-        # ----------------------------------
-        # IMAGE STUDIO
-        # ----------------------------------
+        send_button.click(
+            chat,
+            inputs=[message, chatbot],
+            outputs=[chatbot, message]
+        )
 
-        with gr.Tab("Image Studio"):
+        clear_button.click(
+            lambda: ([], ""),
+            outputs=[chatbot, message]
+        )
 
-            prompt = gr.Textbox(
-                label="Image prompt",
-                placeholder="Describe the image you want..."
-            )
+    with gr.Tab("Image Studio"):
+        gr.Markdown("### Create an image with Alpha")
 
-            generate = gr.Button(
-                "Generate Image",
-                variant="primary"
-            )
+        image_prompt = gr.Textbox(
+            label="Image prompt",
+            placeholder="Describe the image you want..."
+        )
 
-            generated = gr.Image(
-                label="Generated Image",
-                type="filepath"
-            )
+        generate_button = gr.Button(
+            "Generate Image",
+            variant="primary"
+        )
 
-            generate.click(
-                generate_image,
-                inputs=prompt,
-                outputs=generated
-            )
+        generated_image = gr.Image(
+            label="Generated image",
+            type="filepath"
+        )
 
-        # ----------------------------------
-        # IMAGE ANALYSIS
-        # ----------------------------------
+        download_file = gr.File(
+            label="Download generated image"
+        )
 
-        with gr.Tab("Image Analysis"):
+        generate_button.click(
+            generate_image,
+            inputs=image_prompt,
+            outputs=[generated_image, download_file]
+        ).then(
+            lambda path: path,
+            inputs=generated_image,
+            outputs=download_file
+        )
 
-            image = gr.Image(
-                label="Upload image",
-                type="filepath"
-            )
+    with gr.Tab("Image Analysis"):
+        gr.Markdown("### Ask questions about an image")
 
-            image_question = gr.Textbox(
-                label="Ask about the image",
-                placeholder="What is in this image?"
-            )
+        uploaded_image = gr.Image(
+            label="Upload image",
+            type="pil"
+        )
 
-            image_button = gr.Button(
-                "Analyze Image",
-                variant="primary"
-            )
+        image_question = gr.Textbox(
+            label="Your question",
+            placeholder="What is happening in this image?"
+        )
 
-            image_result = gr.Markdown()
+        analyze_image_button = gr.Button(
+            "Analyze Image",
+            variant="primary"
+        )
 
-            image_button.click(
-                analyze_image,
-                inputs=[
-                    image,
-                    image_question
-                ],
-                outputs=image_result
-            )
+        image_result = gr.Markdown()
 
-        # ----------------------------------
-        # VIDEO ANALYSIS
-        # ----------------------------------
+        analyze_image_button.click(
+            analyze_image,
+            inputs=[uploaded_image, image_question],
+            outputs=image_result
+        )
 
-        with gr.Tab("Video Analysis"):
+    with gr.Tab("Video Analysis"):
+        gr.Markdown("### Understand a video with Alpha")
 
-            video = gr.Video(
-                label="Upload video",
-                sources=["upload"]
-            )
+        uploaded_video = gr.Video(
+            label="Upload video"
+        )
 
-            video_question = gr.Textbox(
-                label="Ask about the video",
-                placeholder="Summarize this video..."
-            )
+        video_question = gr.Textbox(
+            label="Your question",
+            placeholder="Summarize this video..."
+        )
 
-            video_button = gr.Button(
-                "Analyze Video",
-                variant="primary"
-            )
+        analyze_video_button = gr.Button(
+            "Analyze Video",
+            variant="primary"
+        )
 
-            video_result = gr.Markdown()
+        video_result = gr.Markdown()
 
-            video_button.click(
-                analyze_video,
-                inputs=[
-                    video,
-                    video_question
-                ],
-                outputs=video_result
-            )
+        analyze_video_button.click(
+            analyze_video,
+            inputs=[uploaded_video, video_question],
+            outputs=video_result
+        )
+
+    gr.Markdown(
+        """
+        ---
+        **Alpha AI** · Think Beyond Limits.
+        """
+    )
 
 
-# ==========================================
-# RENDER STARTUP
-# ==========================================
+# ============================================================
+# START SERVER
+# ============================================================
 
 if __name__ == "__main__":
-
     demo.queue(
-        default_concurrency_limit=2
+        default_concurrency_limit=4,
+        max_size=30
     )
 
     demo.launch(
         server_name="0.0.0.0",
         server_port=PORT
-)
+                   )
     
