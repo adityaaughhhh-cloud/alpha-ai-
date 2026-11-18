@@ -21,8 +21,14 @@ from google.genai import types
 PORT = int(os.getenv("PORT", "10000"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL", "gemini-3.8-flash"
+).strip()
+
+# Optional: configure another model in Render if available.
+GEMINI_BACKUP_MODEL = os.getenv(
+    "GEMINI_BACKUP_MODEL", ""
 ).strip()
 
 CLOUDFLARE_API_TOKEN = os.getenv(
@@ -49,6 +55,7 @@ client = (
     if GEMINI_API_KEY else None
 )
 
+
 SYSTEM_PROMPT = """
 You are Alpha AI, an intelligent and helpful AI assistant.
 
@@ -74,8 +81,51 @@ MATHEMATICS:
 
 CODING:
 - Give practical, correct solutions.
-- Preserve existing working functionality.
+- Preserve existing working functionality when modifying code.
 """
+
+
+# ============== ERROR HANDLING ==============
+
+def is_quota_error(error):
+    message = str(error).upper()
+
+    return (
+        "429" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "QUOTA_EXCEEDED" in message
+    )
+
+
+def friendly_error(error):
+
+    message = str(error)
+
+    if is_quota_error(error):
+        return (
+            "### Alpha has reached its current API limit\n\n"
+            "Gemini is temporarily refusing requests because "
+            "the available API quota or rate limit has been reached.\n\n"
+            "Please try again after the limit resets, or check "
+            "your Google AI Studio usage and billing settings."
+        )
+
+    if "403" in message or "PERMISSION_DENIED" in message:
+        return (
+            "### API access denied\n\n"
+            "Check your Gemini API key, permissions, and model access."
+        )
+
+    if "404" in message or "NOT_FOUND" in message:
+        return (
+            "### Gemini model unavailable\n\n"
+            "Check the GEMINI_MODEL setting in Render."
+        )
+
+    return (
+        "Alpha couldn't complete your request.\n\n"
+        "Error: " + message[:250]
+    )
 
 
 # ============== ANSWER CLEANING ==============
@@ -87,9 +137,7 @@ def clean_answer(answer):
 
     text = str(answer)
 
-    # Remove common math delimiters.
     text = text.replace("$$", "")
-    text = re.sub(r"(?<!\\)\$(.*?)\$", r"\1", text, flags=re.S)
     text = re.sub(r"\\\[|\\\]", "", text)
     text = re.sub(r"\\\(|\\\)", "", text)
 
@@ -184,7 +232,6 @@ def local_math_answer(question):
         expanded = sp.expand(expression)
 
         if "factor" in q:
-
             return (
                 "### Solution\n\n"
                 f"Original expression: {expanded}\n\n"
@@ -232,7 +279,6 @@ def prepare_history(history):
 
     contents = []
 
-    # Keep only the last four exchanges.
     for item in (history or [])[-8:]:
 
         if not isinstance(item, dict):
@@ -247,7 +293,6 @@ def prepare_history(history):
         if not isinstance(content, str) or not content.strip():
             continue
 
-        # Gemini uses "model" for assistant responses.
         gemini_role = (
             "model" if role == "assistant" else "user"
         )
@@ -260,6 +305,19 @@ def prepare_history(history):
         )
 
     return contents
+
+
+def generate_stream_with_model(model, contents):
+
+    return client.models.generate_content_stream(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.25,
+            max_output_tokens=1200
+        )
+    )
 
 
 def stream_gemini_answer(message, history):
@@ -278,28 +336,67 @@ def stream_gemini_answer(message, history):
         )
     )
 
-    stream = client.models.generate_content_stream(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.25,
-            max_output_tokens=1200
-        )
-    )
+    models_to_try = [GEMINI_MODEL]
 
-    accumulated = ""
+    if (
+        GEMINI_BACKUP_MODEL
+        and GEMINI_BACKUP_MODEL != GEMINI_MODEL
+    ):
+        models_to_try.append(GEMINI_BACKUP_MODEL)
 
-    for chunk in stream:
+    last_error = None
 
-        chunk_text = getattr(chunk, "text", None)
+    for model_index, model in enumerate(models_to_try):
 
-        if chunk_text:
-            accumulated += chunk_text
-            yield clean_answer(accumulated)
+        accumulated = ""
 
-    if not accumulated.strip():
-        yield "I couldn't generate an answer. Please try again."
+        try:
+
+            log.info("Starting Gemini request with model: %s", model)
+
+            stream = generate_stream_with_model(
+                model, contents
+            )
+
+            for chunk in stream:
+
+                chunk_text = getattr(chunk, "text", None)
+
+                if chunk_text:
+                    accumulated += chunk_text
+                    yield clean_answer(accumulated)
+
+            if not accumulated.strip():
+                raise RuntimeError(
+                    "Gemini returned an empty response."
+                )
+
+            return
+
+        except Exception as error:
+
+            last_error = error
+
+            log.exception(
+                "Gemini request failed for model %s", model
+            )
+
+            # Do not retry exhausted quota on the same model.
+            # Try the optional backup only once.
+            if (
+                is_quota_error(error)
+                and model_index + 1 < len(models_to_try)
+                and not accumulated
+            ):
+                log.warning(
+                    "Primary model quota reached. Trying backup model."
+                )
+                continue
+
+            raise
+
+    if last_error:
+        raise last_error
 
 
 # ============== CHAT RESPONSE ==============
@@ -321,7 +418,6 @@ def chat_reply(message, history):
 
     try:
 
-        # Local mathematics first.
         answer = local_math_answer(message)
 
         if answer is not None:
@@ -336,7 +432,6 @@ def chat_reply(message, history):
             yield final_history, final_history, ""
             return
 
-        # Gemini streaming for general questions.
         last_answer = ""
 
         for partial_answer in stream_gemini_answer(
@@ -367,10 +462,7 @@ def chat_reply(message, history):
 
         log.exception("Chat error")
 
-        error_message = (
-            "Alpha couldn't complete your request.\n\n"
-            "Error: " + str(error)[:250]
-        )
+        error_message = friendly_error(error)
 
         final_history = working_history + [
             {
@@ -454,7 +546,6 @@ def generate_image(prompt, ratio):
                     "Image provider returned no image."
                 )
 
-            # Handle a possible data URL prefix.
             if isinstance(encoded, str) and "," in encoded:
                 encoded = encoded.split(",", 1)[1]
 
@@ -475,10 +566,7 @@ def generate_image(prompt, ratio):
 
     except (ValueError, KeyError, TypeError) as error:
         log.exception("Image response error")
-        raise gr.Error(
-            "Could not read the image provider response: "
-            + str(error)[:250]
-        )
+        raise gr.Error(str(error)[:250])
 
 
 # ============== IMAGE ANALYSIS ==============
@@ -491,27 +579,33 @@ def analyze_image(image_path, question):
     if client is None:
         raise gr.Error("GEMINI_API_KEY is missing.")
 
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    try:
 
-    prompt = (question or "").strip()
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
 
-    if not prompt:
-        prompt = "Describe this image and its important details."
+        prompt = (question or "").strip()
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt, image],
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.25,
-            max_output_tokens=1100
+        if not prompt:
+            prompt = "Describe this image and its important details."
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt, image],
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.25,
+                max_output_tokens=1100
+            )
         )
-    )
 
-    return clean_answer(
-        getattr(response, "text", "") or ""
-    )
+        return clean_answer(
+            getattr(response, "text", "") or ""
+        )
+
+    except Exception as error:
+        log.exception("Image analysis error")
+        raise gr.Error(friendly_error(error))
 
 
 # ============== VIDEO ANALYSIS ==============
@@ -575,6 +669,10 @@ def analyze_video(video_path, question):
             getattr(response, "text", "") or ""
         )
 
+    except Exception as error:
+        log.exception("Video analysis error")
+        raise gr.Error(friendly_error(error))
+
     finally:
 
         if uploaded is not None:
@@ -601,10 +699,7 @@ with gr.Blocks(
         # CHAT
         with gr.Tab("Chat"):
 
-            # Gradio 6: do not pass the removed "type" argument.
-            chatbot = gr.Chatbot(
-                height=450
-            )
+            chatbot = gr.Chatbot(height=450)
 
             chat_state = gr.State([])
 
@@ -738,5 +833,4 @@ if __name__ == "__main__":
     ).launch(
         server_name="0.0.0.0",
         server_port=PORT
-            )
-    
+        )
