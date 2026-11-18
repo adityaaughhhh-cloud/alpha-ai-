@@ -1,3 +1,4 @@
+
 import os
 import re
 import io
@@ -13,6 +14,7 @@ import sympy as sp
 from PIL import Image
 from google import genai
 from google.genai import types
+
 
 # ============== CONFIGURATION ==============
 
@@ -53,15 +55,15 @@ You are Alpha AI, an intelligent and helpful AI assistant.
 ANSWER RULES:
 1. Answer the user's actual question directly.
 2. Explain difficult topics clearly and accurately.
-3. Use numbered steps when they improve understanding.
+3. Use numbered steps when useful.
 4. Give examples when useful.
 5. Show calculations when necessary.
 6. Use simple English.
 7. Avoid unnecessary introductions and repetition.
 8. Never invent facts.
 9. If uncertain, explain the uncertainty.
-10. For difficult questions, think carefully before answering,
-    but provide only the useful explanation, not hidden reasoning.
+10. Think carefully about difficult questions, but provide
+    only the useful explanation, not hidden reasoning.
 
 MATHEMATICS:
 - Use plain text mathematics.
@@ -72,18 +74,22 @@ MATHEMATICS:
 
 CODING:
 - Give practical, correct solutions.
-- Preserve existing working functionality when modifying code.
+- Preserve existing working functionality.
 """
+
 
 # ============== ANSWER CLEANING ==============
 
 def clean_answer(answer):
+
     if not answer:
         return "I couldn't generate an answer. Please try again."
 
     text = str(answer)
 
+    # Remove common math delimiters.
     text = text.replace("$$", "")
+    text = re.sub(r"(?<!\\)\$(.*?)\$", r"\1", text, flags=re.S)
     text = re.sub(r"\\\[|\\\]", "", text)
     text = re.sub(r"\\\(|\\\)", "", text)
 
@@ -163,6 +169,7 @@ def local_math_answer(question):
     x = sp.Symbol("x")
 
     try:
+
         expression = sp.sympify(
             cleaned,
             locals={"x": x}
@@ -177,6 +184,7 @@ def local_math_answer(question):
         expanded = sp.expand(expression)
 
         if "factor" in q:
+
             return (
                 "### Solution\n\n"
                 f"Original expression: {expanded}\n\n"
@@ -184,6 +192,7 @@ def local_math_answer(question):
             )
 
         if "solve" in q or "=" in question:
+
             roots = sp.solve(
                 sp.Eq(expanded, 0), x
             )
@@ -238,9 +247,14 @@ def prepare_history(history):
         if not isinstance(content, str) or not content.strip():
             continue
 
+        # Gemini uses "model" for assistant responses.
+        gemini_role = (
+            "model" if role == "assistant" else "user"
+        )
+
         contents.append(
             types.Content(
-                role=role,
+                role=gemini_role,
                 parts=[types.Part(text=content)]
             )
         )
@@ -322,7 +336,7 @@ def chat_reply(message, history):
             yield final_history, final_history, ""
             return
 
-        # Gemini streaming for general and difficult questions.
+        # Gemini streaming for general questions.
         last_answer = ""
 
         for partial_answer in stream_gemini_answer(
@@ -440,6 +454,10 @@ def generate_image(prompt, ratio):
                     "Image provider returned no image."
                 )
 
+            # Handle a possible data URL prefix.
+            if isinstance(encoded, str) and "," in encoded:
+                encoded = encoded.split(",", 1)[1]
+
             image_bytes = base64.b64decode(encoded)
 
         output_path = (
@@ -454,6 +472,13 @@ def generate_image(prompt, ratio):
     except requests.RequestException as error:
         log.exception("Image generation error")
         raise gr.Error(str(error)[:300])
+
+    except (ValueError, KeyError, TypeError) as error:
+        log.exception("Image response error")
+        raise gr.Error(
+            "Could not read the image provider response: "
+            + str(error)[:250]
+        )
 
 
 # ============== IMAGE ANALYSIS ==============
@@ -520,6 +545,15 @@ def analyze_video(video_path, question):
             time.sleep(2)
             uploaded = client.files.get(name=uploaded.name)
 
+        state_name = str(
+            getattr(uploaded, "state", "")
+        ).upper()
+
+        if state_name.endswith("FAILED"):
+            raise gr.Error(
+                "The video provider could not process this video."
+            )
+
         prompt = (question or "").strip()
 
         if not prompt:
@@ -567,9 +601,9 @@ with gr.Blocks(
         # CHAT
         with gr.Tab("Chat"):
 
+            # Gradio 6: do not pass the removed "type" argument.
             chatbot = gr.Chatbot(
-                height=450,
-                type="messages"
+                height=450
             )
 
             chat_state = gr.State([])
@@ -704,5 +738,5 @@ if __name__ == "__main__":
     ).launch(
         server_name="0.0.0.0",
         server_port=PORT
-                )
+            )
     
